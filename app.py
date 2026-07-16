@@ -31,7 +31,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 LOG = logging.getLogger("tvheadend-manager")
 DATA_DIR = Path(os.getenv("TVHMON_DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "tvheadend-manager.db"
