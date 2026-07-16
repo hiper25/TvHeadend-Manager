@@ -208,6 +208,7 @@ class MemoryCache:
         self.channels: list[dict[str, Any]] = []
         self.epg: list[dict[str, Any]] = []
         self.inputs: list[dict[str, Any]] = []
+        self.input_history: dict[str, list[dict[str, Any]]] = {}
         self.resources: dict[str, dict[str, Any]] = {}
         self.last_sync: dict[str, Any] | None = None
 
@@ -241,6 +242,20 @@ def safe_connection(entry: dict[str, Any], timestamp: int | None = None) -> dict
             "started": started, "streaming": bool(entry.get("streaming")),
             "type": str(redact_sensitive(entry.get("type") or "未知协议"))[:40],
             "user": str(redact_sensitive(entry.get("user") or "匿名"))[:120]}
+
+
+def signal_diagnosis(item: dict[str, Any], previous_errors: int = 0) -> dict[str, Any]:
+    """Classify a live status sample without consulting tuner configuration."""
+    errors = max(0, int(item.get("errors") or 0))
+    error_delta = max(0, errors - max(0, int(previous_errors or 0)))
+    subscribers = max(0, int(item.get("subscribers") or 0))
+    if subscribers == 0:
+        health = "idle"
+    else:
+        scale, value = int(item.get("signal_scale") or 0), float(item.get("signal") or 0)
+        weak = (scale == 1 and value / 65535 * 100 < 30) or (scale == 2 and value / 1000 < -75)
+        health = "error" if error_delta > 0 else "weak" if weak else "good"
+    return {**item, "error_delta": error_delta, "health": health}
 
 
 class TvhClient:
@@ -457,7 +472,21 @@ class Collector:
                 "sampled_at": ts,
             })
         with CACHE.lock:
-            CACHE.inputs = safe_inputs
+            diagnosed = []
+            active_ids = set()
+            for item in safe_inputs:
+                input_uuid = str(item["input_uuid"])
+                active_ids.add(input_uuid)
+                history = CACHE.input_history.setdefault(input_uuid, [])
+                previous_errors = int(history[-1].get("errors") or 0) if history else 0
+                sample = signal_diagnosis(item, previous_errors)
+                history.append({key: sample.get(key) for key in
+                                ("sampled_at", "signal", "signal_scale", "snr", "snr_scale", "bps",
+                                 "subscribers", "errors", "error_delta", "health")})
+                del history[:-180]
+                diagnosed.append(sample)
+            CACHE.input_history = {key: value for key, value in CACHE.input_history.items() if key in active_ids}
+            CACHE.inputs = diagnosed
         with self.store.connect() as db:
             seen: set[str] = set()
             for sub in subscriptions:
@@ -1153,6 +1182,15 @@ class Handler(SimpleHTTPRequestHandler):
                     inputs = sorted(list(CACHE.inputs), key=lambda x: (-int(x.get("subscribers") or 0), x.get("input_name", "")))
                     last = dict(CACHE.last_sync) if CACHE.last_sync else None
                 self._json({"inputs": inputs, "syncRuns": [last] if last else []})
+            elif path == "/api/status/diagnostics":
+                input_uuid = query.get("input", [""])[0]
+                with CACHE.lock:
+                    current = next((dict(item) for item in CACHE.inputs
+                                    if str(item.get("input_uuid", "")) == input_uuid), None)
+                    history = [dict(item) for item in CACHE.input_history.get(input_uuid, [])]
+                if not current:
+                    raise ValueError("输入不存在或当前没有状态")
+                self._json({"input": current, "history": history, "limit": 180})
             elif path == "/api/clients":
                 with CACHE.lock:
                     resource = dict(CACHE.resources.get("connections", {"entries": [], "error": "尚未取得连接信息"}))
