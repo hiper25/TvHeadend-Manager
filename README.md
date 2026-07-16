@@ -12,10 +12,22 @@ TvHeadend Manager 是一个适合电脑、平板和手机使用的中文 Tvheade
 docker compose up -d --build
 ```
 
-然后打开 `http://服务器地址:8088`。查看日志：
+然后打开：
+
+```text
+http://服务器地址:8088
+```
+
+查看运行日志：
 
 ```bash
 docker compose logs -f tvheadend-manager
+```
+
+更新代码后重新构建：
+
+```bash
+docker compose up -d --build
 ```
 
 数据库保存在 `tvh-data` 数据卷中，重新构建容器不会删除已有设置和观看记录。
@@ -28,10 +40,22 @@ Debian 12/13 安装 Python 3 后，在项目目录运行：
 TVHMON_DATA_DIR=./data python3 app.py --host 0.0.0.0 --port 8088
 ```
 
-只允许本机访问时，把地址换成 `127.0.0.1`。同时监听 IPv6 和 IPv4 时使用：
+只允许本机访问时，把地址换成 `127.0.0.1`：
+
+```bash
+TVHMON_DATA_DIR=./data python3 app.py --host 127.0.0.1 --port 8088
+```
+
+同时监听 IPv6 和 IPv4：
 
 ```bash
 TVHMON_DATA_DIR=./data python3 app.py --host :: --port 8088
+```
+
+IPv6 地址放进浏览器时需要使用方括号，例如：
+
+```text
+http://[2001:db8::10]:8088
 ```
 
 ## 第一次连接
@@ -48,7 +72,7 @@ TVHMON_DATA_DIR=./data python3 app.py --host :: --port 8088
 
 ## 外网和 HTTPS
 
-外网使用时建议设置网页内登录账号，并让 Caddy 或 Nginx 提供 HTTPS：
+外网使用时建议先设置网页登录账号：
 
 ```bash
 export TVHMON_WEB_USERNAME=admin
@@ -57,9 +81,37 @@ export TVHMON_TRUSTED_PROXIES='127.0.0.1/32,::1/128'
 export TVHMON_COOKIE_SECURE=1
 ```
 
-在“连接设置”中填写唯一允许的域名并打开“外部访问强制 HTTPS”。不要直接把 8088 或 Tvheadend 的 9981 端口暴露到公网。局域网地址不要求登录；外部地址使用网页自己的登录框，会话只保存在内存中。
+然后让 Caddy 或 Nginx 提供 HTTPS。Caddy 示例：
 
-需要给播放器提供入口时，可以在同一页面启用安全转发端口。它只放行播放列表、XMLTV、频道流和频道图片，不会转发 Tvheadend 网页、API、Mux、Service 或录像路径。
+```caddyfile
+tv.example.com {
+    reverse_proxy 127.0.0.1:8088
+}
+```
+
+在“连接设置”中把允许域名填写为 `tv.example.com`，并打开“外部访问强制 HTTPS”。不要直接把 8088 或 Tvheadend 的 9981 端口暴露到公网。
+
+通过 HTTPS 域名打开后，可以把网页安装成 PWA：
+
+- iPhone 和 iPad：Safari 分享菜单 → 添加到主屏幕。
+- Android：Chrome 或 Edge 菜单 → 安装应用。
+- 电脑：Chrome 或 Edge 地址栏 → 安装。
+
+普通局域网 HTTP 地址仍可使用网页，但不会完整启用 PWA。`localhost` 可用于本机安装测试。
+
+## 常用环境变量
+
+| 变量 | 用途 |
+| --- | --- |
+| `TVHMON_DATA_DIR` | 数据库保存目录，默认 `./data` |
+| `TVHMON_TVH_PASSWORD` | 使用环境变量提供 Tvheadend 密码 |
+| `TVHMON_WEB_USERNAME` | 外网网页登录用户名 |
+| `TVHMON_WEB_PASSWORD` | 外网网页登录密码 |
+| `TVHMON_TRUSTED_PROXIES` | 可信反向代理地址 |
+| `TVHMON_COOKIE_SECURE` | HTTPS 下设为 `1` |
+| `TVHMON_ALLOWED_HOST` | 唯一允许的外网域名 |
+| `TVHMON_REQUIRE_HTTPS` | 设为 `1` 时拒绝外部 HTTP |
+| `TVHMON_FORWARD_PORT` | Tvheadend 只读媒体转发端口，`0` 表示关闭 |
 
 ## 构建 Debian 单文件程序
 
@@ -68,6 +120,11 @@ export TVHMON_COOKIE_SECURE=1
 ```bash
 chmod +x scripts/build-binary.sh
 ./scripts/build-binary.sh
+```
+
+完成后运行：
+
+```bash
 TVHMON_DATA_DIR=./data ./dist/tvheadend-manager --host 0.0.0.0 --port 8088
 ```
 

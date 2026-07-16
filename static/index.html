@@ -13,7 +13,7 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
   <link rel="manifest" href="/manifest.webmanifest">
-  <link rel="stylesheet" href="/app.css?v=1.2.0">
+  <link rel="stylesheet" href="/app.css?v=1.2.1.0">
 </head>
 <body>
   <aside class="rail" id="rail">
@@ -79,14 +79,6 @@
     </form>
   </dialog>
 
-  <dialog id="clientDisconnectDialog" class="confirm-dialog" tabindex="-1">
-    <form id="clientDisconnectForm">
-      <p class="eyebrow">客户端管理</p><h2>断开这个客户端？</h2>
-      <p class="muted" id="clientDisconnectCopy"></p>
-      <div id="clientDisconnectError" class="form-error"></div>
-      <div class="setup-actions"><button class="tonal" id="clientDisconnectBack" type="button">返回</button><button class="primary danger-action" id="clientDisconnectSubmit" type="submit">确认断开</button></div>
-    </form>
-  </dialog>
   <dialog id="recordDialog" class="record-dialog" tabindex="-1">
     <form id="recordForm">
       <p class="eyebrow">录像</p><h2>从节目单安排录像</h2>
@@ -114,6 +106,15 @@
     </form>
   </dialog>
 
+  <dialog id="clientDisconnectDialog" class="confirm-dialog" tabindex="-1">
+    <form id="clientDisconnectForm">
+      <p class="eyebrow">客户端管理</p><h2>断开这个客户端？</h2>
+      <p class="muted" id="clientDisconnectCopy"></p>
+      <div id="clientDisconnectError" class="form-error"></div>
+      <div class="setup-actions"><button class="tonal" id="clientDisconnectBack" type="button">返回</button><button class="primary danger-action" id="clientDisconnectSubmit" type="submit">确认断开</button></div>
+    </form>
+  </dialog>
+
   <dialog id="recordRuleDialog" class="record-dialog" tabindex="-1">
     <form id="recordRuleForm">
       <p class="eyebrow">录像规则</p><h2 id="recordRuleTitle">新建自动录像</h2>
@@ -133,6 +134,6 @@
       <div class="setup-actions"><button class="tonal" id="recordRuleCancel" type="button">取消</button><button class="primary" id="recordRuleSubmit" type="submit">创建规则</button></div>
     </form>
   </dialog>
-  <script src="/app.js?v=1.2.0" defer></script>
+  <script src="/app.js?v=1.2.1.0" defer></script>
 </body>
 </html>

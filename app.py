@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TvHeadend Manager：一个无运行时第三方依赖的 Tvheadend 管理面板。"""
+"""TvHeadend Manager：一个无运行时第三方依赖的 Tvheadend 监控面板。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 LOG = logging.getLogger("tvheadend-manager")
 DATA_DIR = Path(os.getenv("TVHMON_DATA_DIR", "./data")).resolve()
 DB_PATH = DATA_DIR / "tvheadend-manager.db"
@@ -42,15 +42,19 @@ FULL_SYNC_SECONDS = max(60, int(os.getenv("TVHMON_FULL_SYNC_SECONDS", "300")))
 WEB_SESSION_SECONDS = max(300, int(os.getenv("TVHMON_WEB_SESSION_SECONDS", "43200")))
 WEB_SESSION_COOKIE = "tvhmon_session"
 
+# Web sessions deliberately live only in memory: restarting the service logs
+# external clients out, and no dashboard password or token is written to disk.
 WEB_SESSIONS: dict[str, int] = {}
 WEB_SESSION_LOCK = threading.RLock()
 LOGIN_FAILURES: dict[str, tuple[int, int]] = {}
 LOGIN_FAILURE_LOCK = threading.RLock()
 FORWARD_GATEWAY: "GatewayManager | None" = None
+
 INTERNAL_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
     "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
 ))
+
 FORWARD_PATHS = tuple(re.compile(pattern) for pattern in (
     r"^/playlist(?:/(?:auth|ticket))?(?:/(?:m3u|e2|satip))?/channels$",
     r"^/playlist(?:/(?:auth|ticket))?(?:/(?:m3u|e2|satip))?/(?:channelid|channelnumber|channelname|channel)/[^/]+$",
@@ -85,6 +89,7 @@ def now() -> int:
 
 
 def parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Parse an address, including IPv4-mapped IPv6 and scoped IPv6 input."""
     try:
         address = ipaddress.ip_address(value.strip().split("%", 1)[0])
         if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
@@ -100,6 +105,7 @@ def address_in_networks(address: ipaddress.IPv4Address | ipaddress.IPv6Address |
 
 
 def is_internal_address(value: str) -> bool:
+    """Only explicit LAN, loopback and link-local ranges bypass dashboard login."""
     return address_in_networks(parse_ip(value), INTERNAL_NETWORKS)
 
 
@@ -146,7 +152,8 @@ class Store:
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Preserve existing installations after the public project rename.
+        # Keep existing installations intact after the public project rename.
+        # SQLite sidecars are moved with the main database if they still exist.
         if path == DB_PATH and not path.exists() and LEGACY_DB_PATH.exists():
             LEGACY_DB_PATH.replace(path)
             for suffix in ("-wal", "-shm"):
@@ -220,6 +227,20 @@ class MemoryCache:
 CACHE = MemoryCache()
 
 
+def signal_diagnosis(item: dict[str, Any], previous_errors: int = 0) -> dict[str, Any]:
+    """Classify a live status sample without consulting tuner configuration."""
+    errors = max(0, int(item.get("errors") or 0))
+    error_delta = max(0, errors - max(0, int(previous_errors or 0)))
+    subscribers = max(0, int(item.get("subscribers") or 0))
+    if subscribers == 0:
+        health = "idle"
+    else:
+        scale, value = int(item.get("signal_scale") or 0), float(item.get("signal") or 0)
+        weak = (scale == 1 and value / 65535 * 100 < 30) or (scale == 2 and value / 1000 < -75)
+        health = "error" if error_delta > 0 else "weak" if weak else "good"
+    return {**item, "error_delta": error_delta, "health": health}
+
+
 def safe_connection(entry: dict[str, Any], timestamp: int | None = None) -> dict[str, Any] | None:
     """Return only the client-facing connection fields needed by management UI."""
     timestamp = timestamp if timestamp is not None else now()
@@ -242,20 +263,6 @@ def safe_connection(entry: dict[str, Any], timestamp: int | None = None) -> dict
             "started": started, "streaming": bool(entry.get("streaming")),
             "type": str(redact_sensitive(entry.get("type") or "未知协议"))[:40],
             "user": str(redact_sensitive(entry.get("user") or "匿名"))[:120]}
-
-
-def signal_diagnosis(item: dict[str, Any], previous_errors: int = 0) -> dict[str, Any]:
-    """Classify a live status sample without consulting tuner configuration."""
-    errors = max(0, int(item.get("errors") or 0))
-    error_delta = max(0, errors - max(0, int(previous_errors or 0)))
-    subscribers = max(0, int(item.get("subscribers") or 0))
-    if subscribers == 0:
-        health = "idle"
-    else:
-        scale, value = int(item.get("signal_scale") or 0), float(item.get("signal") or 0)
-        weak = (scale == 1 and value / 65535 * 100 < 30) or (scale == 2 and value / 1000 < -75)
-        health = "error" if error_delta > 0 else "weak" if weak else "good"
-    return {**item, "error_delta": error_delta, "health": health}
 
 
 class TvhClient:
@@ -718,6 +725,7 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _client_ip(self) -> str:
+        """Resolve a proxy address only when its socket peer is explicitly trusted."""
         peer = parse_ip(self.client_address[0])
         proxies = trusted_proxy_networks()
         if not address_in_networks(peer, proxies):
@@ -726,10 +734,13 @@ class Handler(SimpleHTTPRequestHandler):
         for address in reversed([item for item in forwarded if item]):
             if not address_in_networks(address, proxies):
                 return str(address)
+        # A trusted proxy without a usable forwarding chain is unknown, not
+        # local. Treat it as external so a proxy mistake cannot bypass login.
         return "0.0.0.0"
 
     def _request_host(self) -> str:
-        peer, proxies = parse_ip(self.client_address[0]), trusted_proxy_networks()
+        peer = parse_ip(self.client_address[0])
+        proxies = trusted_proxy_networks()
         value = self.headers.get("Host", "")
         if address_in_networks(peer, proxies):
             value = self.headers.get("X-Forwarded-Host", value).split(",")[-1].strip()
@@ -750,7 +761,8 @@ class Handler(SimpleHTTPRequestHandler):
         if is_internal_address(self._client_ip()):
             return True, ""
         allowed_host = os.getenv("TVHMON_ALLOWED_HOST", STORE.setting("allowed_host", "")).strip().rstrip(".").casefold()
-        require_https = os.getenv("TVHMON_REQUIRE_HTTPS", STORE.setting("require_https", "0")).lower() in ("1", "true", "yes", "on")
+        require_https_value = os.getenv("TVHMON_REQUIRE_HTTPS", STORE.setting("require_https", "0"))
+        require_https = require_https_value.lower() in ("1", "true", "yes", "on")
         if allowed_host and self._request_host() != allowed_host:
             return False, "此域名不允许访问"
         if require_https and not self._is_https():
@@ -783,7 +795,8 @@ class Handler(SimpleHTTPRequestHandler):
             for old_token, expires in list(WEB_SESSIONS.items()):
                 if expires <= ts:
                     WEB_SESSIONS.pop(old_token, None)
-            return WEB_SESSIONS.get(token, 0) > ts
+            expires = WEB_SESSIONS.get(token, 0)
+            return expires > ts
 
     def _authorized(self) -> bool:
         username, password = self._web_credentials()
@@ -806,8 +819,8 @@ class Handler(SimpleHTTPRequestHandler):
     def _auth_status(self) -> None:
         username, password = self._web_credentials()
         enabled, internal = bool(username or password), is_internal_address(self._client_ip())
-        self._json({"required": enabled and not internal,
-                    "authenticated": not enabled or internal or self._session_valid(),
+        authenticated = not enabled or internal or self._session_valid()
+        self._json({"required": enabled and not internal, "authenticated": authenticated,
                     "internal": internal, "configured": bool(username and password)})
 
     def _login(self) -> None:
@@ -941,7 +954,7 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError("频道不存在")
                 conf = {"enabled": enabled, "name": name[:80], "title": title,
                         "fulltext": bool(body.get("fulltext")), "channel": channel,
-                        "config_name": config_uuid, "comment": "由 TVH 管理台创建"}
+                        "config_name": config_uuid, "comment": "由 TvHeadend Manager 创建"}
                 result = client.request("dvr/autorec/create",
                                         {"conf": json.dumps(conf, ensure_ascii=False), "config_uuid": config_uuid}, method="POST")
                 COLLECTOR.trigger()
@@ -967,7 +980,7 @@ class Handler(SimpleHTTPRequestHandler):
                     raise ValueError("频道不存在")
                 conf = {"enabled": enabled, "name": name, "title": title or name, "channel": channel,
                         "start": start, "stop": stop, "weekdays": weekdays, "config_name": config_uuid,
-                        "comment": "由 TVH 管理台创建"}
+                        "comment": "由 TvHeadend Manager 创建"}
                 result = client.request("dvr/timerec/create",
                                         {"conf": json.dumps(conf, ensure_ascii=False), "config_uuid": config_uuid}, method="POST")
                 COLLECTOR.trigger()
@@ -1064,7 +1077,7 @@ class Handler(SimpleHTTPRequestHandler):
                 if "forwardPort" in body:
                     forward_port = int(body["forwardPort"] or 0)
                     if forward_port != 0 and not 1024 <= forward_port <= 65535:
-                        raise ValueError("转发端口只能留空/填 0 关闭，或填写 1024-65535")
+                        raise ValueError("转发端口只能留空/填 0 关闭，或填写 1024–65535")
                     if FORWARD_GATEWAY is not None:
                         FORWARD_GATEWAY.configure(forward_port)
                     saved["forward_port"] = str(forward_port)
@@ -1257,7 +1270,7 @@ class Handler(SimpleHTTPRequestHandler):
         if not entry:
             raise ValueError("已完成录像不存在或当前账号无权下载")
         target = urllib.parse.urljoin(client.url + "/", f"dvrfile/{uuid}")
-        headers = {"User-Agent": f"TVH-Insight/{APP_VERSION}", "Authorization": client.basic_authorization}
+        headers = {"User-Agent": f"TvHeadend-Manager/{APP_VERSION}", "Authorization": client.basic_authorization}
         if self.headers.get("Range"):
             headers["Range"] = self.headers["Range"]
         request = urllib.request.Request(target, headers=headers)
@@ -1304,34 +1317,15 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(data)
 
 
-class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
-    address_family = socket.AF_INET6
-
-    def server_bind(self) -> None:
-        if self.server_address[0] == "::":
-            try:
-                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-            except OSError:
-                pass
-        super().server_bind()
-
-
-def create_http_server(host: str, port: int, handler: type[SimpleHTTPRequestHandler]) -> ThreadingHTTPServer:
-    server_type = IPv6ThreadingHTTPServer if ":" in host else ThreadingHTTPServer
-    return server_type((host, port), handler)
-
-
-def display_endpoint(host: str, port: int) -> str:
-    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
-
-
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Never let an upstream redirect turn the gateway into an open proxy."""
+
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
 class GatewayHandler(Handler):
-    """Read-only Tvheadend gateway with an explicit media allowlist."""
+    """Small, read-only Tvheadend gateway with an explicit media allowlist."""
 
     def _gateway(self, head_only: bool = False) -> None:
         if not self._require_access_policy():
@@ -1351,11 +1345,11 @@ class GatewayHandler(Handler):
             self._json({"ok": False, "error": "尚未配置 TvHeadend"}, HTTPStatus.SERVICE_UNAVAILABLE)
             return
         target = target_base + parsed.path + (("?" + parsed.query) if parsed.query else "")
-        headers = {"User-Agent": f"TvHeadend-Manager-Gateway/{APP_VERSION}",
-                   "Accept": self.headers.get("Accept", "*/*")}
+        headers = {"User-Agent": f"TvHeadend-Manager-Gateway/{APP_VERSION}", "Accept": self.headers.get("Accept", "*/*")}
         for name in ("Authorization", "Range"):
             if self.headers.get(name):
                 headers[name] = self.headers[name]
+        # Tvheadend uses Host when producing URLs inside an M3U playlist.
         forwarded_host = self.headers.get("Host", "")
         peer = parse_ip(self.client_address[0])
         if address_in_networks(peer, trusted_proxy_networks()):
@@ -1363,6 +1357,7 @@ class GatewayHandler(Handler):
         if forwarded_host:
             headers["Host"] = forwarded_host
         request = urllib.request.Request(target, headers=headers, method="HEAD" if head_only else "GET")
+        response = None
         try:
             response = urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=20)
         except urllib.error.HTTPError as exc:
@@ -1375,11 +1370,12 @@ class GatewayHandler(Handler):
             if not head_only and decoded_path.startswith("/playlist") and self._is_https() and 200 <= response.status < 300:
                 buffered_body = response.read(8 * 1024 * 1024 + 1)
                 if len(buffered_body) > 8 * 1024 * 1024:
+                    response.close()
                     self._json({"ok": False, "error": "播放列表异常大，已停止转发"}, HTTPStatus.BAD_GATEWAY)
                     return
                 if forwarded_host:
-                    buffered_body = buffered_body.replace(f"http://{forwarded_host}/".encode(),
-                                                          f"https://{forwarded_host}/".encode())
+                    source = f"http://{forwarded_host}/".encode()
+                    buffered_body = buffered_body.replace(source, f"https://{forwarded_host}/".encode())
             self.send_response(response.status)
             for name in ("Content-Type", "Content-Disposition", "Content-Length", "Accept-Ranges",
                          "Content-Range", "ETag", "Last-Modified", "WWW-Authenticate"):
@@ -1414,6 +1410,28 @@ class GatewayHandler(Handler):
         self._json({"ok": False, "error": "转发端口只允许读取"}, HTTPStatus.METHOD_NOT_ALLOWED)
 
 
+class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        if self.server_address[0] == "::":
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                # Some kernels fix this policy globally; IPv6 still remains usable.
+                pass
+        super().server_bind()
+
+
+def create_http_server(host: str, port: int, handler: type[SimpleHTTPRequestHandler]) -> ThreadingHTTPServer:
+    server_type = IPv6ThreadingHTTPServer if ":" in host else ThreadingHTTPServer
+    return server_type((host, port), handler)
+
+
+def display_endpoint(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
 class GatewayManager:
     def __init__(self, host: str):
         self.host = os.getenv("TVHMON_FORWARD_HOST", host)
@@ -1426,12 +1444,13 @@ class GatewayManager:
         with self.lock:
             if port == self.port:
                 return
-            try:
-                new_server = create_http_server(self.host, port, GatewayHandler) if port else None
-            except OSError as exc:
-                raise ValueError(f"无法监听转发端口 {port}：{exc}") from exc
+            new_server = None
             new_thread = None
-            if new_server:
+            if port:
+                try:
+                    new_server = create_http_server(self.host, port, GatewayHandler)
+                except OSError as exc:
+                    raise ValueError(f"无法监听转发端口 {port}：{exc}") from exc
                 new_thread = threading.Thread(target=new_server.serve_forever, name="tvh-gateway", daemon=True)
                 new_thread.start()
             old_server, old_thread = self.server, self.thread
@@ -1443,6 +1462,8 @@ class GatewayManager:
                 old_thread.join(timeout=2)
             if port:
                 LOG.info("Tvheadend 安全转发正在监听 http://%s", display_endpoint(self.host, port))
+            elif old_server:
+                LOG.info("Tvheadend 安全转发已关闭")
 
     def close(self) -> None:
         self.configure(0)
