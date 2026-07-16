@@ -28,7 +28,7 @@ Debian 12/13 安装 Python 3 后，在项目目录运行：
 TVHMON_DATA_DIR=./data python3 app.py --host 0.0.0.0 --port 8088
 ```
 
-只允许本机访问时，把地址换成 `127.0.0.1`。同时监听 IPv6 和 IPv4时使用：
+只允许本机访问时，把地址换成 `127.0.0.1`。同时监听 IPv6 和 IPv4 时使用：
 
 ```bash
 TVHMON_DATA_DIR=./data python3 app.py --host :: --port 8088
@@ -45,6 +45,19 @@ TVHMON_DATA_DIR=./data python3 app.py --host :: --port 8088
 ```
 
 地址中不要包含用户名和密码。Tvheadend 账号建议开启 Web interface、Video recorder 和 Admin 权限，并把运行 TvHeadend Manager 的设备地址加入允许的网络。
+
+## 外网和 HTTPS
+
+外网使用时建议设置网页内登录账号，并让 Caddy 或 Nginx 提供 HTTPS：
+
+```bash
+export TVHMON_WEB_USERNAME=admin
+export TVHMON_WEB_PASSWORD='请换成长密码'
+export TVHMON_TRUSTED_PROXIES='127.0.0.1/32,::1/128'
+export TVHMON_COOKIE_SECURE=1
+```
+
+在“连接设置”中填写唯一允许的域名并打开“外部访问强制 HTTPS”。不要直接把 8088 或 Tvheadend 的 9981 端口暴露到公网。局域网地址不要求登录；外部地址使用网页自己的登录框，会话只保存在内存中。
 
 ## 构建 Debian 单文件程序
 

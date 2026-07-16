@@ -41,6 +41,20 @@
     </div>
   </main>
 
+  <dialog id="loginDialog" class="login-dialog" tabindex="-1">
+    <form id="loginForm">
+      <div class="setup-symbol"><img src="/favicon.svg" alt=""></div>
+      <p class="eyebrow">外部访问</p>
+      <h2>登录 TvHeadend Manager</h2>
+      <p class="muted">此连接来自外部网络，请先验证身份。局域网设备不会看到此页面。</p>
+      <label class="md-field"><input name="username" autocomplete="username" placeholder=" " required><span>用户名</span></label>
+      <label class="md-field"><input name="password" type="password" autocomplete="current-password" placeholder=" " required><span>密码</span></label>
+      <div id="loginError" class="form-error"></div>
+      <button class="primary" id="loginSubmit" type="submit">登录</button>
+      <small>登录信息只用于本次验证，不会保存在浏览器或数据库中。</small>
+    </form>
+  </dialog>
+
   <dialog id="setupDialog" tabindex="-1">
     <form id="setupForm" method="dialog">
       <div class="setup-symbol"><img src="/favicon.svg" alt=""></div>

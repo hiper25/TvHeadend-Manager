@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -13,6 +14,7 @@ import os
 import signal
 import secrets
 import socket
+import ssl
 import sqlite3
 import sys
 import threading
@@ -23,6 +25,7 @@ import urllib.request
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,17 @@ LEGACY_DB_PATH = DATA_DIR / "tvh-insight.db"
 STATIC_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "static"
 POLL_SECONDS = max(5, int(os.getenv("TVHMON_POLL_SECONDS", "10")))
 FULL_SYNC_SECONDS = max(60, int(os.getenv("TVHMON_FULL_SYNC_SECONDS", "300")))
+WEB_SESSION_SECONDS = max(300, int(os.getenv("TVHMON_WEB_SESSION_SECONDS", "43200")))
+WEB_SESSION_COOKIE = "tvhmon_session"
+
+WEB_SESSIONS: dict[str, int] = {}
+WEB_SESSION_LOCK = threading.RLock()
+LOGIN_FAILURES: dict[str, tuple[int, int]] = {}
+LOGIN_FAILURE_LOCK = threading.RLock()
+INTERNAL_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+    "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+))
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -58,6 +72,37 @@ OBSOLETE_TABLES = ("channels", "epg_events", "input_samples", "current_inputs", 
 
 def now() -> int:
     return int(time.time())
+
+
+def parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        address = ipaddress.ip_address(value.strip().split("%", 1)[0])
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            return address.ipv4_mapped
+        return address
+    except ValueError:
+        return None
+
+
+def address_in_networks(address: ipaddress.IPv4Address | ipaddress.IPv6Address | None,
+                        networks: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]) -> bool:
+    return bool(address and any(address.version == network.version and address in network for network in networks))
+
+
+def is_internal_address(value: str) -> bool:
+    return address_in_networks(parse_ip(value), INTERNAL_NETWORKS)
+
+
+def trusted_proxy_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    networks = []
+    for value in os.getenv("TVHMON_TRUSTED_PROXIES", "").split(","):
+        if not value.strip():
+            continue
+        try:
+            networks.append(ipaddress.ip_network(value.strip(), strict=False))
+        except ValueError:
+            LOG.warning("忽略无效的 TVHMON_TRUSTED_PROXIES 地址段：%s", value.strip())
+    return tuple(networks)
 
 
 def scalar(value: Any, default: Any = "") -> Any:
@@ -444,7 +489,7 @@ class Handler(SimpleHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s - %s", self.client_address[0], fmt % args)
 
-    def _json(self, data: Any, status: int = 200) -> None:
+    def _json(self, data: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -452,22 +497,140 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
 
-    def _authorized(self) -> bool:
-        username = os.getenv("TVHMON_WEB_USERNAME", "")
-        password = os.getenv("TVHMON_WEB_PASSWORD", "")
-        if not username:
+    def _client_ip(self) -> str:
+        peer = parse_ip(self.client_address[0])
+        proxies = trusted_proxy_networks()
+        if not address_in_networks(peer, proxies):
+            return str(peer) if peer else self.client_address[0]
+        forwarded = [parse_ip(item) for item in self.headers.get("X-Forwarded-For", "").split(",")]
+        for address in reversed([item for item in forwarded if item]):
+            if not address_in_networks(address, proxies):
+                return str(address)
+        return "0.0.0.0"
+
+    def _request_host(self) -> str:
+        peer, proxies = parse_ip(self.client_address[0]), trusted_proxy_networks()
+        value = self.headers.get("Host", "")
+        if address_in_networks(peer, proxies):
+            value = self.headers.get("X-Forwarded-Host", value).split(",")[-1].strip()
+        try:
+            return (urllib.parse.urlsplit("//" + value).hostname or "").rstrip(".").casefold()
+        except ValueError:
+            return ""
+
+    def _is_https(self) -> bool:
+        if isinstance(self.connection, ssl.SSLSocket):
             return True
-        expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
-        if secrets.compare_digest(self.headers.get("Authorization", ""), expected):
-            return True
-        self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="TvHeadend Manager", charset="UTF-8"')
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        peer = parse_ip(self.client_address[0])
+        if address_in_networks(peer, trusted_proxy_networks()):
+            return self.headers.get("X-Forwarded-Proto", "").split(",")[-1].strip().lower() == "https"
         return False
+
+    def _access_policy(self) -> tuple[bool, str]:
+        if is_internal_address(self._client_ip()):
+            return True, ""
+        allowed_host = os.getenv("TVHMON_ALLOWED_HOST", STORE.setting("allowed_host", "")).strip().rstrip(".").casefold()
+        require_https = os.getenv("TVHMON_REQUIRE_HTTPS", STORE.setting("require_https", "0")).lower() in ("1", "true", "yes", "on")
+        if allowed_host and self._request_host() != allowed_host:
+            return False, "此域名不允许访问"
+        if require_https and not self._is_https():
+            return False, "外部访问必须使用 HTTPS"
+        return True, ""
+
+    def _require_access_policy(self) -> bool:
+        allowed, message = self._access_policy()
+        if allowed:
+            return True
+        self._json({"ok": False, "error": message}, HTTPStatus.FORBIDDEN)
+        return False
+
+    def _web_credentials(self) -> tuple[str, str]:
+        return os.getenv("TVHMON_WEB_USERNAME", ""), os.getenv("TVHMON_WEB_PASSWORD", "")
+
+    def _session_token(self) -> str:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+            return cookie[WEB_SESSION_COOKIE].value if WEB_SESSION_COOKIE in cookie else ""
+        except Exception:
+            return ""
+
+    def _session_valid(self) -> bool:
+        token, ts = self._session_token(), now()
+        if not token:
+            return False
+        with WEB_SESSION_LOCK:
+            for old_token, expires in list(WEB_SESSIONS.items()):
+                if expires <= ts:
+                    WEB_SESSIONS.pop(old_token, None)
+            return WEB_SESSIONS.get(token, 0) > ts
+
+    def _authorized(self) -> bool:
+        username, password = self._web_credentials()
+        if not username and not password:
+            return True
+        return is_internal_address(self._client_ip()) or self._session_valid()
+
+    def _require_authorized(self) -> bool:
+        if self._authorized():
+            return True
+        self._json({"ok": False, "error": "需要登录"}, HTTPStatus.UNAUTHORIZED)
+        return False
+
+    def _cookie_header(self, token: str, max_age: int) -> str:
+        value = f"{WEB_SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+        if os.getenv("TVHMON_COOKIE_SECURE", "").lower() in ("1", "true", "yes", "on"):
+            value += "; Secure"
+        return value
+
+    def _auth_status(self) -> None:
+        username, password = self._web_credentials()
+        enabled, internal = bool(username or password), is_internal_address(self._client_ip())
+        self._json({"required": enabled and not internal,
+                    "authenticated": not enabled or internal or self._session_valid(),
+                    "internal": internal, "configured": bool(username and password)})
+
+    def _login(self) -> None:
+        username, password = self._web_credentials()
+        client_ip, ts = self._client_ip(), now()
+        if is_internal_address(client_ip) or (not username and not password):
+            self._json({"ok": True})
+            return
+        if not username or not password:
+            self._error(ValueError("服务器未完整配置外网登录账号和密码"), 503)
+            return
+        with LOGIN_FAILURE_LOCK:
+            failures, blocked_until = LOGIN_FAILURES.get(client_ip, (0, 0))
+        if blocked_until > ts:
+            self._error(ValueError(f"登录尝试过多，请在 {blocked_until - ts} 秒后重试"), 429)
+            return
+        body = self._body()
+        supplied_user, supplied_password = str(body.get("username", "")), str(body.get("password", ""))
+        valid = secrets.compare_digest(supplied_user, username) and secrets.compare_digest(supplied_password, password)
+        if not valid:
+            failures += 1
+            blocked_until = ts + 60 if failures >= 5 else 0
+            with LOGIN_FAILURE_LOCK:
+                LOGIN_FAILURES[client_ip] = (failures, blocked_until)
+            self._error(ValueError("用户名或密码错误"), HTTPStatus.UNAUTHORIZED)
+            return
+        token = secrets.token_urlsafe(32)
+        with WEB_SESSION_LOCK:
+            WEB_SESSIONS[token] = ts + WEB_SESSION_SECONDS
+        with LOGIN_FAILURE_LOCK:
+            LOGIN_FAILURES.pop(client_ip, None)
+        self._json({"ok": True}, headers={"Set-Cookie": self._cookie_header(token, WEB_SESSION_SECONDS)})
+
+    def _logout(self) -> None:
+        token = self._session_token()
+        with WEB_SESSION_LOCK:
+            WEB_SESSIONS.pop(token, None)
+        self._json({"ok": True}, headers={"Set-Cookie": self._cookie_header("", 0)})
 
     def _body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -479,11 +642,17 @@ class Handler(SimpleHTTPRequestHandler):
         self._json({"ok": False, "error": str(exc)}, status)
 
     def do_POST(self) -> None:
-        if not self._authorized():
-            return
         path = urllib.parse.urlparse(self.path).path
         try:
-            if path == "/api/setup":
+            if not self._require_access_policy():
+                return
+            if path == "/api/auth/login":
+                self._login()
+            elif path == "/api/auth/logout":
+                self._logout()
+            elif not self._require_authorized():
+                return
+            elif path == "/api/setup":
                 body = self._body()
                 url = str(body.get("url", "")).strip().rstrip("/")
                 if not url.startswith(("http://", "https://")):
@@ -515,27 +684,57 @@ class Handler(SimpleHTTPRequestHandler):
                 COLLECTOR.trigger()
                 self._json({"ok": True, "id": connection_id})
             elif path.rstrip("/") == "/api/preferences":
-                interval = int(self._body().get("pollSeconds", 0))
-                if interval not in (10, 20, 30, 60):
-                    raise ValueError("采集间隔只能选择 10、20、30 或 60 秒")
-                STORE.save_settings({"poll_seconds": str(interval)})
-                COLLECTOR.wake_event.set()
-                self._json({"ok": True, "pollSeconds": interval})
+                body = self._body()
+                saved: dict[str, str] = {}
+                response: dict[str, Any] = {"ok": True}
+                if "pollSeconds" in body:
+                    interval = int(body["pollSeconds"])
+                    if interval not in (10, 20, 30, 60):
+                        raise ValueError("采集间隔只能选择 10、20、30 或 60 秒")
+                    saved["poll_seconds"] = str(interval)
+                    response["pollSeconds"] = interval
+                if "allowedHost" in body:
+                    allowed_host = str(body["allowedHost"]).strip().rstrip(".").casefold()
+                    if allowed_host:
+                        parsed_host = urllib.parse.urlsplit("//" + allowed_host)
+                        if parsed_host.hostname != allowed_host or parsed_host.port or parsed_host.username:
+                            raise ValueError("只填写域名，例如 tv.example.com，不要填写协议、端口或路径")
+                        try:
+                            allowed_host = allowed_host.encode("idna").decode("ascii")
+                        except UnicodeError as exc:
+                            raise ValueError("域名格式无效") from exc
+                    saved["allowed_host"] = allowed_host
+                    response["allowedHost"] = allowed_host
+                if "requireHttps" in body:
+                    saved["require_https"] = "1" if bool(body["requireHttps"]) else "0"
+                    response["requireHttps"] = saved["require_https"] == "1"
+                if not saved:
+                    raise ValueError("没有可保存的设置")
+                STORE.save_settings(saved)
+                if "poll_seconds" in saved:
+                    COLLECTOR.wake_event.set()
+                self._json(response)
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self._error(exc)
 
     def do_GET(self) -> None:
-        if not self._authorized():
-            return
         parsed = urllib.parse.urlparse(self.path)
         path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
         try:
-            if path == "/api/bootstrap":
+            if not self._require_access_policy():
+                return
+            if path == "/api/auth/status":
+                self._auth_status()
+            elif path.startswith("/api/") and not self._require_authorized():
+                return
+            elif path == "/api/bootstrap":
                 cfg = STORE.settings()
                 self._json({"configured": bool(cfg.get("tvh_url")), "url": cfg.get("tvh_url", ""),
                             "username": cfg.get("tvh_username", ""), "pollSeconds": COLLECTOR.poll_seconds(),
+                            "allowedHost": os.getenv("TVHMON_ALLOWED_HOST", cfg.get("allowed_host", "")),
+                            "requireHttps": os.getenv("TVHMON_REQUIRE_HTTPS", cfg.get("require_https", "0")).lower() in ("1", "true", "yes", "on"),
                             "version": APP_VERSION, "lastSync": CACHE.last_sync})
             elif path == "/api/dashboard":
                 self._dashboard()
