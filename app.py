@@ -390,7 +390,7 @@ class Collector:
                 "channel_uuid": e.get("channelUuid"), "channel_name": scalar(e.get("channelName")),
                 "title": scalar(e.get("title"), "无标题"), "subtitle": scalar(e.get("subtitle")),
                 "summary": scalar(e.get("summary") or e.get("description")), "start": e.get("start"),
-                "stop": e.get("stop"), "genre": genre, "updated_at": ts,
+                "stop": e.get("stop"), "genre": genre, "dvr_state": e.get("dvrState", ""), "updated_at": ts,
             })
         with CACHE.lock:
             CACHE.channels = safe_channels
@@ -491,6 +491,70 @@ COLLECTOR = Collector(STORE)
 
 def rows(db: sqlite3.Connection, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     return [dict(row) for row in db.execute(query, params).fetchall()]
+
+
+def recording_is_cancelable(entry: dict[str, Any], timestamp: int | None = None) -> bool:
+    """Only future timers may be cancelled from this deliberately narrow UI."""
+    timestamp = timestamp if timestamp is not None else now()
+    status = str(scalar(entry.get("status") or entry.get("sched_status"))).casefold()
+    return bool(re.fullmatch(r"[0-9a-fA-F]{32}", str(entry.get("uuid", "")))) and \
+        int(entry.get("start") or 0) > timestamp and "scheduled" in status
+
+
+def recording_is_running(entry: dict[str, Any]) -> bool:
+    sched_status = str(scalar(entry.get("sched_status"))).strip().casefold()
+    status = str(scalar(entry.get("status"))).strip().casefold()
+    return sched_status == "recording" or status == "recording" or status.startswith("recording ")
+
+
+def recording_enabled_is_editable(entry: dict[str, Any]) -> bool:
+    """Only upcoming timers which are not already recording may be enabled or disabled."""
+    return valid_uuid(str(entry.get("uuid", ""))) and not recording_is_running(entry)
+
+
+def safe_recording_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Expose display metadata but never the DVR storage filename or URL."""
+    allowed = ("uuid", "enabled", "start", "stop", "channel", "channelname", "channel_icon",
+               "title", "disp_title", "subtitle", "disp_subtitle", "status", "sched_status",
+               "description", "disp_summary", "owner", "creator", "create", "duration")
+    return {key: redact_sensitive(entry.get(key), key, hide_frequency=False)
+            for key in allowed if key in entry}
+
+
+def safe_autorec_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    allowed = ("uuid", "enabled", "title", "channel", "tag", "start", "start_window", "weekdays",
+               "comment", "owner", "creator", "maxcount", "maxsched", "minduration", "maxduration")
+    return {key: redact_sensitive(entry.get(key), key, hide_frequency=False)
+            for key in allowed if key in entry}
+
+
+def safe_timerec_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    allowed = ("uuid", "enabled", "name", "title", "channel", "start", "stop", "weekdays",
+               "comment", "owner", "creator")
+    return {key: redact_sensitive(entry.get(key), key, hide_frequency=False)
+            for key in allowed if key in entry}
+
+
+def sort_dvr_entries(entries: list[dict[str, Any]], section: str) -> None:
+    """Sort timers by timestamp and text-based rules without assuming one field type."""
+    if section in ("autorecs", "timerecs"):
+        entries.sort(key=lambda item: (
+            item.get("enabled") is False,
+            str(scalar(item.get("name") or item.get("title"), "")).casefold(),
+        ))
+        return
+
+    def timestamp(item: dict[str, Any]) -> int:
+        try:
+            return int(item.get("start") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    entries.sort(key=timestamp, reverse=section != "upcoming")
+
+
+def valid_uuid(value: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-fA-F]{32}", value))
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -693,6 +757,122 @@ class Handler(SimpleHTTPRequestHandler):
                 client.request("connections/cancel", {"id": connection_id}, method="POST")
                 COLLECTOR.trigger()
                 self._json({"ok": True, "id": connection_id})
+            elif path == "/api/dvr/schedule":
+                body = self._body()
+                event_id, config_uuid = str(body.get("eventId", "")), str(body.get("configUuid", ""))
+                if not event_id.isdigit() or not re.fullmatch(r"[0-9a-fA-F]{32}", config_uuid):
+                    raise ValueError("录像节目或配置无效")
+                with CACHE.lock:
+                    event = next((item for item in CACHE.epg if item.get("event_id") == event_id), None)
+                if not event or int(event.get("start") or 0) <= now():
+                    raise ValueError("该节目不存在或已经开始")
+                client = COLLECTOR.client()
+                profiles = client.request("dvr/config/grid", {"limit": 100}).get("entries", [])
+                if config_uuid not in {str(item.get("uuid", "")) for item in profiles}:
+                    raise ValueError("录像配置不存在或不可用")
+                result = client.request("dvr/entry/create_by_event",
+                                        {"event_id": event_id, "config_uuid": config_uuid}, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True, "uuid": result.get("uuid", "")})
+            elif path == "/api/dvr/cancel":
+                uuid = str(self._body().get("uuid", ""))
+                recordings = COLLECTOR.client().request("dvr/entry/grid_upcoming", {"limit": 10000}).get("entries", [])
+                entry = next((item for item in recordings if str(item.get("uuid", "")) == uuid), None)
+                if not entry or not recording_is_cancelable(entry):
+                    raise ValueError("只允许取消尚未开始的定时录像")
+                COLLECTOR.client().request("dvr/entry/cancel", {"uuid": uuid}, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True})
+            elif path == "/api/dvr/autorec/create":
+                body, client = self._body(), COLLECTOR.client()
+                title, name = str(body.get("title", "")).strip(), str(body.get("name", "")).strip()
+                channel, config_uuid = str(body.get("channel", "")), str(body.get("configUuid", ""))
+                if not title or len(title) > 120 or (channel and not valid_uuid(channel)) or not valid_uuid(config_uuid):
+                    raise ValueError("自动录像规则内容无效")
+                profiles = client.request("dvr/config/grid", {"limit": 100}).get("entries", [])
+                if config_uuid not in {str(item.get("uuid", "")) for item in profiles}:
+                    raise ValueError("录像配置不存在")
+                with CACHE.lock:
+                    channel_ids = {str(item.get("uuid", "")) for item in CACHE.channels}
+                if channel and channel not in channel_ids:
+                    raise ValueError("频道不存在")
+                conf = {"enabled": True, "name": name[:80], "title": title,
+                        "fulltext": bool(body.get("fulltext")), "channel": channel,
+                        "config_name": config_uuid, "comment": "由 TVH 管理台创建"}
+                result = client.request("dvr/autorec/create",
+                                        {"conf": json.dumps(conf, ensure_ascii=False), "config_uuid": config_uuid}, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True, "uuid": result.get("uuid", "")})
+            elif path == "/api/dvr/timerec/create":
+                body, client = self._body(), COLLECTOR.client()
+                name, title = str(body.get("name", "")).strip(), str(body.get("title", "")).strip()
+                channel, config_uuid = str(body.get("channel", "")), str(body.get("configUuid", ""))
+                start, stop = str(body.get("start", "")), str(body.get("stop", ""))
+                weekdays = sorted({int(day) for day in body.get("weekdays", []) if str(day).isdigit()})
+                if (not name or len(name) > 80 or len(title) > 120 or not valid_uuid(channel)
+                        or not valid_uuid(config_uuid) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start)
+                        or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", stop) or not weekdays
+                        or any(day not in range(1, 8) for day in weekdays)):
+                    raise ValueError("手动定时录像内容无效")
+                profiles = client.request("dvr/config/grid", {"limit": 100}).get("entries", [])
+                if config_uuid not in {str(item.get("uuid", "")) for item in profiles}:
+                    raise ValueError("录像配置不存在")
+                with CACHE.lock:
+                    channel_ids = {str(item.get("uuid", "")) for item in CACHE.channels}
+                if channel not in channel_ids:
+                    raise ValueError("频道不存在")
+                conf = {"enabled": True, "name": name, "title": title or name, "channel": channel,
+                        "start": start, "stop": stop, "weekdays": weekdays, "config_name": config_uuid,
+                        "comment": "由 TVH 管理台创建"}
+                result = client.request("dvr/timerec/create",
+                                        {"conf": json.dumps(conf, ensure_ascii=False), "config_uuid": config_uuid}, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True, "uuid": result.get("uuid", "")})
+            elif path == "/api/dvr/action":
+                body, client = self._body(), COLLECTOR.client()
+                action, uuid = str(body.get("action", "")), str(body.get("uuid", ""))
+                if not valid_uuid(uuid):
+                    raise ValueError("录像 UUID 无效")
+                action_sources = {
+                    "stop": ("dvr/entry/grid_upcoming", "dvr/entry/stop"),
+                    "cancel": ("dvr/entry/grid_upcoming", "dvr/entry/cancel"),
+                    "previously_recorded": ("dvr/entry/grid_upcoming", "dvr/entry/prevrec/toggle"),
+                    "remove": ("dvr/entry/grid_finished", "dvr/entry/remove"),
+                    "rerecord_finished": ("dvr/entry/grid_finished", "dvr/entry/rerecord/toggle"),
+                    "rerecord_failed": ("dvr/entry/grid_failed", "dvr/entry/rerecord/toggle"),
+                    "move_finished": ("dvr/entry/grid_failed", "dvr/entry/move/finished"),
+                    "move_failed": ("dvr/entry/grid_finished", "dvr/entry/move/failed"),
+                    "delete_autorec": ("dvr/autorec/grid", "idnode/delete"),
+                    "delete_timerec": ("dvr/timerec/grid", "idnode/delete"),
+                }
+                if action not in action_sources:
+                    raise ValueError("不允许的录像操作")
+                source, endpoint = action_sources[action]
+                entries = client.request(source, {"limit": 10000}).get("entries", [])
+                entry = next((item for item in entries if str(item.get("uuid", "")) == uuid), None)
+                if not entry:
+                    raise ValueError("录像项目不存在或状态已经改变")
+                if action == "cancel" and not recording_is_cancelable(entry):
+                    raise ValueError("该录像已不能取消")
+                if action == "stop" and not recording_is_running(entry):
+                    raise ValueError("该录像当前未在录制")
+                client.request(endpoint, {"uuid": uuid}, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True})
+            elif path == "/api/dvr/enabled":
+                body, client = self._body(), COLLECTOR.client()
+                uuid, enabled = str(body.get("uuid", "")), body.get("enabled")
+                if not valid_uuid(uuid) or not isinstance(enabled, bool):
+                    raise ValueError("录像开关参数无效")
+                entries = client.request("dvr/entry/grid_upcoming", {"limit": 10000}).get("entries", [])
+                entry = next((item for item in entries if str(item.get("uuid", "")) == uuid), None)
+                if not entry or not recording_enabled_is_editable(entry):
+                    raise ValueError("该待录像项目不存在、已开始录制或状态已经改变")
+                client.request("idnode/save", {
+                    "node": json.dumps({"uuid": uuid, "enabled": enabled}, separators=(",", ":"))
+                }, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True, "enabled": enabled})
             elif path.rstrip("/") == "/api/preferences":
                 body = self._body()
                 saved: dict[str, str] = {}
@@ -775,6 +955,41 @@ class Handler(SimpleHTTPRequestHandler):
                 entries = [e for e in entries if (e.get("stop") or 0) >= now() - 3600 and
                            (not needle or needle in " ".join(str(e.get(k, "")) for k in ("title", "channel_name", "summary")).casefold())]
                 self._json({"entries": sorted(entries, key=lambda e: e.get("start") or 0)[:500]})
+            elif path == "/api/dvr/options":
+                search = query.get("q", [""])[0][:100].casefold()
+                with CACHE.lock:
+                    events = [dict(item) for item in CACHE.epg if int(item.get("start") or 0) > now()]
+                if search:
+                    events = [item for item in events if search in
+                              f"{item.get('title', '')} {item.get('channel_name', '')}".casefold()]
+                profiles = COLLECTOR.client().request("dvr/config/grid", {"limit": 100}).get("entries", [])
+                safe_profiles = [{"uuid": str(item.get("uuid", "")),
+                                  "name": str(item.get("name") or "默认录像配置")}
+                                 for item in profiles if re.fullmatch(r"[0-9a-fA-F]{32}", str(item.get("uuid", "")))]
+                with CACHE.lock:
+                    channels = [{"uuid": str(item.get("uuid", "")), "name": str(item.get("name", "")),
+                                 "number": str(item.get("number", ""))} for item in CACHE.channels if item.get("enabled", 1)]
+                self._json({"profiles": safe_profiles, "channels": channels,
+                            "events": sorted(events, key=lambda item: item.get("start") or 0)[:80]})
+            elif path == "/api/dvr/library":
+                section = query.get("section", ["upcoming"])[0]
+                endpoints = {
+                    "upcoming": "dvr/entry/grid_upcoming", "finished": "dvr/entry/grid_finished",
+                    "failed": "dvr/entry/grid_failed", "removed": "dvr/entry/grid_removed",
+                    "autorecs": "dvr/autorec/grid", "timerecs": "dvr/timerec/grid",
+                }
+                if section not in endpoints:
+                    raise ValueError("录像分类无效")
+                entries = COLLECTOR.client().request(endpoints[section], {"limit": 10000}).get("entries", [])
+                sanitizer = safe_autorec_entry if section == "autorecs" else safe_timerec_entry if section == "timerecs" else safe_recording_entry
+                safe_entries = [sanitizer(item) for item in entries]
+                if section in ("autorecs", "timerecs"):
+                    with CACHE.lock:
+                        channel_names = {str(item.get("uuid", "")): str(item.get("name", "")) for item in CACHE.channels}
+                    for item in safe_entries:
+                        item["channel"] = channel_names.get(str(item.get("channel", "")), item.get("channel", ""))
+                sort_dvr_entries(safe_entries, section)
+                self._json({"section": section, "entries": safe_entries, "total": len(safe_entries)})
             elif path == "/api/history":
                 with STORE.connect() as db:
                     self._json({
@@ -795,6 +1010,8 @@ class Handler(SimpleHTTPRequestHandler):
                 with CACHE.lock:
                     result = json.loads(json.dumps(CACHE.resources, ensure_ascii=False))
                 self._json({"resources": result})
+            elif path.startswith("/api/dvr/download/"):
+                self._dvr_download(path.rsplit("/", 1)[-1])
             elif path.startswith("/api/channels/") and path.endswith("/icon"):
                 self._channel_icon(path.split("/")[3])
             elif path.startswith("/api/"):
@@ -841,6 +1058,45 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "private, max-age=3600")
         self.end_headers()
         self.wfile.write(data)
+
+    def _dvr_download(self, uuid: str) -> None:
+        if not valid_uuid(uuid):
+            raise ValueError("录像 UUID 无效")
+        client = COLLECTOR.client()
+        entries = client.request("dvr/entry/grid_finished", {"limit": 10000}).get("entries", [])
+        entry = next((item for item in entries if str(item.get("uuid", "")) == uuid), None)
+        if not entry:
+            raise ValueError("已完成录像不存在或当前账号无权下载")
+        target = urllib.parse.urljoin(client.url + "/", f"dvrfile/{uuid}")
+        headers = {"User-Agent": f"TVH-Insight/{APP_VERSION}", "Authorization": client.basic_authorization}
+        if self.headers.get("Range"):
+            headers["Range"] = self.headers["Range"]
+        request = urllib.request.Request(target, headers=headers)
+        try:
+            response = client.opener.open(request, timeout=max(client.timeout, 60))
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403, 404):
+                raise ValueError("Tvheadend 拒绝下载该录像") from exc
+            raise RuntimeError(f"Tvheadend 下载返回 HTTP {exc.code}") from exc
+        try:
+            self.send_response(response.status)
+            self.send_header("Content-Type", response.headers.get("Content-Type", "application/octet-stream"))
+            for name in ("Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"):
+                if response.headers.get(name):
+                    self.send_header(name, response.headers[name])
+            title = str(scalar(entry.get("title") or entry.get("disp_title"), "录像"))
+            title = re.sub(r"[\x00-\x1f\\/:*?\"<>|]", "_", title).strip(" .")[:120] or "录像"
+            self.send_header("Content-Disposition", "attachment; filename=recording.ts; filename*=UTF-8''" +
+                             urllib.parse.quote(title + ".ts"))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "private, no-store")
+            self.end_headers()
+            while chunk := response.read(128 * 1024):
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            response.close()
 
     def _static(self, path: str) -> None:
         relative = "index.html" if path in ("", "/") else path.lstrip("/")
