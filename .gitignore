@@ -1,0 +1,31 @@
+data/
+dist/
+build/
+.build-venv/
+__pycache__/
+*.pyc
+
+# Runtime databases and their SQLite sidecar files must never enter Git.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local credentials, reverse-proxy certificates and private configuration.
+.env
+.env.*
+!.env.example
+secrets/
+credentials*.json
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Local editor, operating-system and log files.
+.DS_Store
+.idea/
+.vscode/
+*.log
