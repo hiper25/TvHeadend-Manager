@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TVH 管理台：一个无运行时第三方依赖的 Tvheadend 监控面板。"""
+"""TvHeadend Manager：一个无运行时第三方依赖的 Tvheadend 管理面板。"""
 
 from __future__ import annotations
 
@@ -28,9 +28,10 @@ from pathlib import Path
 from typing import Any
 
 APP_VERSION = "1.0.0"
-LOG = logging.getLogger("tvh-insight")
+LOG = logging.getLogger("tvheadend-manager")
 DATA_DIR = Path(os.getenv("TVHMON_DATA_DIR", "./data")).resolve()
-DB_PATH = DATA_DIR / "tvh-insight.db"
+DB_PATH = DATA_DIR / "tvheadend-manager.db"
+LEGACY_DB_PATH = DATA_DIR / "tvh-insight.db"
 STATIC_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "static"
 POLL_SECONDS = max(5, int(os.getenv("TVHMON_POLL_SECONDS", "10")))
 FULL_SYNC_SECONDS = max(60, int(os.getenv("TVHMON_FULL_SYNC_SECONDS", "300")))
@@ -90,6 +91,13 @@ class Store:
     def __init__(self, path: Path):
         self.path = path
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Preserve existing installations after the public project rename.
+        if path == DB_PATH and not path.exists() and LEGACY_DB_PATH.exists():
+            LEGACY_DB_PATH.replace(path)
+            for suffix in ("-wal", "-shm"):
+                legacy_sidecar = Path(f"{LEGACY_DB_PATH}{suffix}")
+                if legacy_sidecar.exists():
+                    legacy_sidecar.replace(Path(f"{path}{suffix}"))
         with self.connect() as db:
             db.executescript(SCHEMA)
             columns = {row["name"] for row in db.execute("PRAGMA table_info(viewing_sessions)")}
@@ -201,7 +209,7 @@ class TvhClient:
         # Some TVH "plain" configurations return 403 without sending an HTTP
         # authentication challenge. Preemptive Basic is needed for those builds;
         # the opener still handles a Digest challenge when the server sends one.
-        headers = {"Accept": "application/json", "User-Agent": f"TVH-Insight/{APP_VERSION}",
+        headers = {"Accept": "application/json", "User-Agent": f"TvHeadend-Manager/{APP_VERSION}",
                    "Authorization": self.basic_authorization}
         data = encoded.encode() if method == "POST" else None
         if data is not None:
@@ -240,7 +248,7 @@ class TvhClient:
             urllib.parse.quote(parsed.query, safe="=&;%:+,/?@!$'()*-._~"),
             "",
         ))
-        headers = {"User-Agent": f"TVH-Insight/{APP_VERSION}"}
+        headers = {"User-Agent": f"TvHeadend-Manager/{APP_VERSION}"}
         # External channel logos are allowed, but TVH credentials must only ever
         # be sent back to the configured Tvheadend origin.
         base_origin = urllib.parse.urlsplit(self.url)
@@ -431,7 +439,7 @@ def rows(db: sqlite3.Connection, query: str, params: tuple[Any, ...] = ()) -> li
 
 
 class Handler(SimpleHTTPRequestHandler):
-    server_version = f"TVH-Insight/{APP_VERSION}"
+    server_version = f"TvHeadend-Manager/{APP_VERSION}"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("%s - %s", self.client_address[0], fmt % args)
@@ -456,7 +464,7 @@ class Handler(SimpleHTTPRequestHandler):
         if secrets.compare_digest(self.headers.get("Authorization", ""), expected):
             return True
         self.send_response(401)
-        self.send_header("WWW-Authenticate", 'Basic realm="TVH 管理台", charset="UTF-8"')
+        self.send_header("WWW-Authenticate", 'Basic realm="TvHeadend Manager", charset="UTF-8"')
         self.send_header("Content-Length", "0")
         self.end_headers()
         return False
@@ -664,7 +672,7 @@ def main() -> None:
     COLLECTOR.start()
     server = create_http_server(args.host, args.port, Handler)
     signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
-    LOG.info("TVH 管理台 %s listening on http://%s", APP_VERSION, display_endpoint(args.host, args.port))
+    LOG.info("TvHeadend Manager %s listening on http://%s", APP_VERSION, display_endpoint(args.host, args.port))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
