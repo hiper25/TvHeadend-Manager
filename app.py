@@ -11,6 +11,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import signal
 import secrets
 import socket
@@ -45,10 +46,19 @@ WEB_SESSIONS: dict[str, int] = {}
 WEB_SESSION_LOCK = threading.RLock()
 LOGIN_FAILURES: dict[str, tuple[int, int]] = {}
 LOGIN_FAILURE_LOCK = threading.RLock()
+FORWARD_GATEWAY: "GatewayManager | None" = None
 INTERNAL_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
     "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
     "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
 ))
+FORWARD_PATHS = tuple(re.compile(pattern) for pattern in (
+    r"^/playlist(?:/(?:auth|ticket))?(?:/(?:m3u|e2|satip))?/channels$",
+    r"^/playlist(?:/(?:auth|ticket))?(?:/(?:m3u|e2|satip))?/(?:channelid|channelnumber|channelname|channel)/[^/]+$",
+    r"^/xmltv/(?:channels|channelid/[^/]+|channelnumber/[^/]+|channelname/[^/]+|channel/[^/]+)$",
+    r"^/stream/(?:channelid|channelnumber|channelname|channel)/[^/]+$",
+    r"^/imagecache/[^/]+$",
+))
+FORWARD_QUERY_KEYS = {"auth", "ticket", "profile", "sort", "lang", "weight", "qsize", "timeshift", "descramble"}
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -708,6 +718,14 @@ class Handler(SimpleHTTPRequestHandler):
                 if "requireHttps" in body:
                     saved["require_https"] = "1" if bool(body["requireHttps"]) else "0"
                     response["requireHttps"] = saved["require_https"] == "1"
+                if "forwardPort" in body:
+                    forward_port = int(body["forwardPort"] or 0)
+                    if forward_port != 0 and not 1024 <= forward_port <= 65535:
+                        raise ValueError("转发端口只能留空/填 0 关闭，或填写 1024-65535")
+                    if FORWARD_GATEWAY is not None:
+                        FORWARD_GATEWAY.configure(forward_port)
+                    saved["forward_port"] = str(forward_port)
+                    response["forwardPort"] = forward_port
                 if not saved:
                     raise ValueError("没有可保存的设置")
                 STORE.save_settings(saved)
@@ -735,6 +753,7 @@ class Handler(SimpleHTTPRequestHandler):
                             "username": cfg.get("tvh_username", ""), "pollSeconds": COLLECTOR.poll_seconds(),
                             "allowedHost": os.getenv("TVHMON_ALLOWED_HOST", cfg.get("allowed_host", "")),
                             "requireHttps": os.getenv("TVHMON_REQUIRE_HTTPS", cfg.get("require_https", "0")).lower() in ("1", "true", "yes", "on"),
+                            "forwardPort": int(os.getenv("TVHMON_FORWARD_PORT", cfg.get("forward_port", "0")) or 0),
                             "version": APP_VERSION, "lastSync": CACHE.last_sync})
             elif path == "/api/dashboard":
                 self._dashboard()
@@ -823,6 +842,22 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _static(self, path: str) -> None:
+        relative = "index.html" if path in ("", "/") else path.lstrip("/")
+        candidate = (STATIC_DIR / relative).resolve()
+        if STATIC_DIR.resolve() not in candidate.parents and candidate != STATIC_DIR.resolve():
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        if not candidate.is_file():
+            candidate = STATIC_DIR / "index.html"
+        data = candidate.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(candidate.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
 
 class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
     address_family = socket.AF_INET6
@@ -844,24 +879,132 @@ def create_http_server(host: str, port: int, handler: type[SimpleHTTPRequestHand
 def display_endpoint(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
-    def _static(self, path: str) -> None:
-        relative = "index.html" if path in ("", "/") else path.lstrip("/")
-        candidate = (STATIC_DIR / relative).resolve()
-        if STATIC_DIR.resolve() not in candidate.parents and candidate != STATIC_DIR.resolve():
-            self.send_error(HTTPStatus.FORBIDDEN)
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class GatewayHandler(Handler):
+    """Read-only Tvheadend gateway with an explicit media allowlist."""
+
+    def _gateway(self, head_only: bool = False) -> None:
+        if not self._require_access_policy():
             return
-        if not candidate.is_file():
-            candidate = STATIC_DIR / "index.html"
-        data = candidate.read_bytes()
-        self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(candidate.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-cache")
-        self.end_headers()
-        self.wfile.write(data)
+        parsed = urllib.parse.urlsplit(self.path)
+        decoded_path = urllib.parse.unquote(parsed.path)
+        if (len(self.path) > 4096 or ".." in decoded_path or "%" in decoded_path or "\\" in decoded_path
+                or not any(rule.fullmatch(decoded_path) for rule in FORWARD_PATHS)):
+            self._json({"ok": False, "error": "此 Tvheadend 路径未开放"}, HTTPStatus.FORBIDDEN)
+            return
+        query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        if any(key not in FORWARD_QUERY_KEYS for key in query):
+            self._json({"ok": False, "error": "请求参数未列入白名单"}, HTTPStatus.FORBIDDEN)
+            return
+        target_base = STORE.setting("tvh_url", "").rstrip("/")
+        if not target_base:
+            self._json({"ok": False, "error": "尚未配置 TvHeadend"}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        target = target_base + parsed.path + (("?" + parsed.query) if parsed.query else "")
+        headers = {"User-Agent": f"TvHeadend-Manager-Gateway/{APP_VERSION}",
+                   "Accept": self.headers.get("Accept", "*/*")}
+        for name in ("Authorization", "Range"):
+            if self.headers.get(name):
+                headers[name] = self.headers[name]
+        forwarded_host = self.headers.get("Host", "")
+        peer = parse_ip(self.client_address[0])
+        if address_in_networks(peer, trusted_proxy_networks()):
+            forwarded_host = self.headers.get("X-Forwarded-Host", forwarded_host).split(",")[-1].strip()
+        if forwarded_host:
+            headers["Host"] = forwarded_host
+        request = urllib.request.Request(target, headers=headers, method="HEAD" if head_only else "GET")
+        try:
+            response = urllib.request.build_opener(NoRedirectHandler()).open(request, timeout=20)
+        except urllib.error.HTTPError as exc:
+            response = exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._json({"ok": False, "error": f"TvHeadend 转发失败：{exc}"}, HTTPStatus.BAD_GATEWAY)
+            return
+        buffered_body = None
+        try:
+            if not head_only and decoded_path.startswith("/playlist") and self._is_https() and 200 <= response.status < 300:
+                buffered_body = response.read(8 * 1024 * 1024 + 1)
+                if len(buffered_body) > 8 * 1024 * 1024:
+                    self._json({"ok": False, "error": "播放列表异常大，已停止转发"}, HTTPStatus.BAD_GATEWAY)
+                    return
+                if forwarded_host:
+                    buffered_body = buffered_body.replace(f"http://{forwarded_host}/".encode(),
+                                                          f"https://{forwarded_host}/".encode())
+            self.send_response(response.status)
+            for name in ("Content-Type", "Content-Disposition", "Content-Length", "Accept-Ranges",
+                         "Content-Range", "ETag", "Last-Modified", "WWW-Authenticate"):
+                if buffered_body is not None and name == "Content-Length":
+                    continue
+                value = response.headers.get(name)
+                if value:
+                    self.send_header(name, value)
+            if buffered_body is not None:
+                self.send_header("Content-Length", str(len(buffered_body)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store" if decoded_path.startswith("/playlist") else "private")
+            self.end_headers()
+            if not head_only:
+                if buffered_body is not None:
+                    self.wfile.write(buffered_body)
+                else:
+                    while chunk := response.read(64 * 1024):
+                        self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            response.close()
+
+    def do_GET(self) -> None:
+        self._gateway()
+
+    def do_HEAD(self) -> None:
+        self._gateway(head_only=True)
+
+    def do_POST(self) -> None:
+        self._json({"ok": False, "error": "转发端口只允许读取"}, HTTPStatus.METHOD_NOT_ALLOWED)
+
+
+class GatewayManager:
+    def __init__(self, host: str):
+        self.host = os.getenv("TVHMON_FORWARD_HOST", host)
+        self.server: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.port = 0
+        self.lock = threading.RLock()
+
+    def configure(self, port: int) -> None:
+        with self.lock:
+            if port == self.port:
+                return
+            try:
+                new_server = create_http_server(self.host, port, GatewayHandler) if port else None
+            except OSError as exc:
+                raise ValueError(f"无法监听转发端口 {port}：{exc}") from exc
+            new_thread = None
+            if new_server:
+                new_thread = threading.Thread(target=new_server.serve_forever, name="tvh-gateway", daemon=True)
+                new_thread.start()
+            old_server, old_thread = self.server, self.thread
+            self.server, self.thread, self.port = new_server, new_thread, port
+            if old_server:
+                old_server.shutdown()
+                old_server.server_close()
+            if old_thread and old_thread is not threading.current_thread():
+                old_thread.join(timeout=2)
+            if port:
+                LOG.info("Tvheadend 安全转发正在监听 http://%s", display_endpoint(self.host, port))
+
+    def close(self) -> None:
+        self.configure(0)
 
 
 def main() -> None:
+    global FORWARD_GATEWAY
     parser = argparse.ArgumentParser(description="TvHeadend monitoring dashboard")
     parser.add_argument("--host", default=os.getenv("TVHMON_HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.getenv("TVHMON_PORT", "8088")))
@@ -870,6 +1013,9 @@ def main() -> None:
     logging.basicConfig(level=os.getenv("TVHMON_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     COLLECTOR.start()
     server = create_http_server(args.host, args.port, Handler)
+    FORWARD_GATEWAY = GatewayManager(args.host)
+    configured_forward_port = int(os.getenv("TVHMON_FORWARD_PORT", STORE.setting("forward_port", "0")) or 0)
+    FORWARD_GATEWAY.configure(configured_forward_port)
     signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
     LOG.info("TvHeadend Manager %s listening on http://%s", APP_VERSION, display_endpoint(args.host, args.port))
     try:
@@ -878,6 +1024,8 @@ def main() -> None:
         pass
     finally:
         COLLECTOR.stop_event.set()
+        if FORWARD_GATEWAY:
+            FORWARD_GATEWAY.close()
         server.server_close()
 
 
