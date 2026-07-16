@@ -957,18 +957,23 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({"entries": sorted(entries, key=lambda e: e.get("start") or 0)[:500]})
             elif path == "/api/dvr/options":
                 search = query.get("q", [""])[0][:100].casefold()
+                channel = query.get("channel", [""])[0]
                 with CACHE.lock:
                     events = [dict(item) for item in CACHE.epg if int(item.get("start") or 0) > now()]
+                    channels = [{"uuid": str(item.get("uuid", "")), "name": str(item.get("name", "")),
+                                 "number": str(item.get("number", ""))} for item in CACHE.channels if item.get("enabled", 1)]
+                channel_ids = {item["uuid"] for item in channels}
+                if channel and (not valid_uuid(channel) or channel not in channel_ids):
+                    raise ValueError("频道筛选无效")
                 if search:
                     events = [item for item in events if search in
                               f"{item.get('title', '')} {item.get('channel_name', '')}".casefold()]
+                if channel:
+                    events = [item for item in events if str(item.get("channel_uuid", "")) == channel]
                 profiles = COLLECTOR.client().request("dvr/config/grid", {"limit": 100}).get("entries", [])
                 safe_profiles = [{"uuid": str(item.get("uuid", "")),
                                   "name": str(item.get("name") or "默认录像配置")}
                                  for item in profiles if re.fullmatch(r"[0-9a-fA-F]{32}", str(item.get("uuid", "")))]
-                with CACHE.lock:
-                    channels = [{"uuid": str(item.get("uuid", "")), "name": str(item.get("name", "")),
-                                 "number": str(item.get("number", ""))} for item in CACHE.channels if item.get("enabled", 1)]
                 self._json({"profiles": safe_profiles, "channels": channels,
                             "events": sorted(events, key=lambda item: item.get("start") or 0)[:80]})
             elif path == "/api/dvr/library":

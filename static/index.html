@@ -87,6 +87,51 @@
       <div class="setup-actions"><button class="tonal" id="clientDisconnectBack" type="button">返回</button><button class="primary danger-action" id="clientDisconnectSubmit" type="submit">确认断开</button></div>
     </form>
   </dialog>
+  <dialog id="recordDialog" class="record-dialog" tabindex="-1">
+    <form id="recordForm">
+      <p class="eyebrow">录像</p><h2>从节目单安排录像</h2>
+      <p class="muted">选择尚未开始的节目，Tvheadend 会使用所选录像配置建立单次定时器。</p>
+      <div class="record-dialog-grid schedule-dialog-grid">
+        <div class="record-dialog-pane">
+          <label class="md-field"><input id="recordSearch" placeholder=" "><span>搜索节目</span></label>
+          <label class="md-field"><input id="recordChannelSearch" placeholder=" "><span>搜索频道</span></label>
+          <div class="rule-choice-list channel-choice-list" id="recordChannels"></div>
+          <div id="recordProfiles" class="profile-choices"></div>
+        </div>
+        <div class="record-dialog-pane event-picker-pane"><small class="picker-title">选择节目</small><div id="recordEvents" class="record-event-list"></div></div>
+      </div>
+      <div id="recordError" class="form-error"></div>
+      <div class="setup-actions"><button class="tonal" id="recordCancel" type="button">取消</button><button class="primary" id="recordSubmit" type="submit" disabled>安排录像</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="cancelRecordDialog" class="confirm-dialog" tabindex="-1">
+    <form id="cancelRecordForm">
+      <p class="eyebrow">确认操作</p><h2 id="dvrActionTitle">确认录像操作？</h2>
+      <p class="muted" id="cancelRecordTitle"></p>
+      <div id="cancelRecordError" class="form-error"></div>
+      <div class="setup-actions"><button class="tonal" id="cancelRecordBack" type="button">返回</button><button class="primary danger-action" id="cancelRecordSubmit" type="submit">确认取消</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="recordRuleDialog" class="record-dialog" tabindex="-1">
+    <form id="recordRuleForm">
+      <p class="eyebrow">录像规则</p><h2 id="recordRuleTitle">新建自动录像</h2>
+      <p class="muted" id="recordRuleHelp"></p>
+      <div class="record-dialog-grid record-rule-grid">
+        <div class="record-dialog-pane">
+          <label class="md-field"><input id="ruleName" placeholder=" " required><span>规则名称</span></label>
+          <label class="md-field"><input id="ruleTitle" placeholder=" "><span id="ruleTitleLabel">节目标题表达式</span></label>
+          <div id="ruleTimes" class="rule-times hidden"><label class="md-field"><input id="ruleStart" placeholder=" " value="20:00"><span>开始时间 HH:MM</span></label><label class="md-field"><input id="ruleStop" placeholder=" " value="21:00"><span>结束时间 HH:MM</span></label></div>
+          <label class="switch-row" id="ruleFulltextRow"><span><strong>搜索完整节目资料</strong><small>同时匹配副标题、摘要和描述</small></span><input id="ruleFulltext" type="checkbox"><i></i></label>
+          <div id="ruleWeekdays" class="weekday-choices hidden"></div>
+        </div>
+        <div class="record-dialog-pane"><small class="picker-title">频道与录像配置</small><label class="md-field channel-search"><input id="ruleChannelSearch" placeholder=" "><span>搜索频道</span></label><div class="rule-choice-list" id="ruleChannels"></div><div><small>录像配置</small><div class="profile-choices" id="ruleProfiles"></div></div></div>
+      </div>
+      <div id="recordRuleError" class="form-error"></div>
+      <div class="setup-actions"><button class="tonal" id="recordRuleCancel" type="button">取消</button><button class="primary" id="recordRuleSubmit" type="submit">创建规则</button></div>
+    </form>
+  </dialog>
   <script src="/app.js?v=1.0.1" defer></script>
 </body>
 </html>
