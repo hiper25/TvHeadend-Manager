@@ -553,6 +553,44 @@ def sort_dvr_entries(entries: list[dict[str, Any]], section: str) -> None:
     entries.sort(key=timestamp, reverse=section != "upcoming")
 
 
+def recording_attention_entries(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return upcoming timers which are disabled, unhealthy or overlap another timer."""
+    safe_entries = [safe_recording_entry(item) for item in entries]
+    result: list[dict[str, Any]] = []
+    normal_sched = {"scheduled", "recording"}
+    for entry in safe_entries:
+        reasons: list[str] = []
+        if entry.get("enabled") is False:
+            reasons.append("录像已停用")
+        sched = str(scalar(entry.get("sched_status"), "")).strip().casefold()
+        status = str(scalar(entry.get("status"), "")).strip()
+        if sched and sched not in normal_sched:
+            reasons.append(status or f"状态异常：{sched}")
+        try:
+            start, stop = int(entry.get("start") or 0), int(entry.get("stop") or 0)
+        except (TypeError, ValueError):
+            start = stop = 0
+        overlap = 0
+        if entry.get("enabled") is not False and start and stop > start:
+            for other in safe_entries:
+                if other.get("enabled") is False:
+                    continue
+                try:
+                    other_start, other_stop = int(other.get("start") or 0), int(other.get("stop") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if other_start < stop and other_stop > start:
+                    overlap += 1
+        if overlap > 1:
+            reasons.append(f"同一时段共有 {overlap} 项录像，请检查输入容量")
+        if reasons:
+            entry["conflict_reasons"] = reasons
+            entry["overlap_count"] = overlap
+            result.append(entry)
+    sort_dvr_entries(result, "upcoming")
+    return result
+
+
 def valid_uuid(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{32}", value))
 
@@ -978,6 +1016,11 @@ class Handler(SimpleHTTPRequestHandler):
                             "events": sorted(events, key=lambda item: item.get("start") or 0)[:80]})
             elif path == "/api/dvr/library":
                 section = query.get("section", ["upcoming"])[0]
+                if section == "conflicts":
+                    entries = COLLECTOR.client().request("dvr/entry/grid_upcoming", {"limit": 10000}).get("entries", [])
+                    safe_entries = recording_attention_entries(entries)
+                    self._json({"section": section, "entries": safe_entries, "total": len(safe_entries)})
+                    return
                 endpoints = {
                     "upcoming": "dvr/entry/grid_upcoming", "finished": "dvr/entry/grid_finished",
                     "failed": "dvr/entry/grid_failed", "removed": "dvr/entry/grid_removed",
