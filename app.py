@@ -24,7 +24,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -389,8 +389,13 @@ class Collector:
                 "event_id": str(e.get("eventId") or e.get("id") or f"{e.get('channelUuid')}:{e.get('start')}"),
                 "channel_uuid": e.get("channelUuid"), "channel_name": scalar(e.get("channelName")),
                 "title": scalar(e.get("title"), "无标题"), "subtitle": scalar(e.get("subtitle")),
-                "summary": scalar(e.get("summary") or e.get("description")), "start": e.get("start"),
-                "stop": e.get("stop"), "genre": genre, "dvr_state": e.get("dvrState", ""), "updated_at": ts,
+                "summary": scalar(e.get("summary")), "description": scalar(e.get("description")),
+                "start": e.get("start"), "stop": e.get("stop"), "genre": genre,
+                "episode": scalar(e.get("episodeNumber") or e.get("episodeText")),
+                "age_rating": e.get("ageRating"), "star_rating": e.get("starRating"),
+                "is_new": bool(e.get("new")), "is_hd": bool(e.get("hd")),
+                "is_subtitled": bool(e.get("subtitled")), "dvr_state": e.get("dvrState", ""),
+                "updated_at": ts,
             })
         with CACHE.lock:
             CACHE.channels = safe_channels
@@ -594,6 +599,40 @@ def recording_attention_entries(entries: list[dict[str, Any]]) -> list[dict[str,
 
 def valid_uuid(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{32}", value))
+
+
+def filter_epg_entries(entries: list[dict[str, Any]], mode: str = "all", search: str = "",
+                       channel: str = "", timestamp: int | None = None) -> list[dict[str, Any]]:
+    """Filter cached EPG using the server's local day boundaries."""
+    timestamp = timestamp if timestamp is not None else now()
+    if mode not in ("all", "now", "tonight", "tomorrow"):
+        raise ValueError("节目单分类无效")
+    current = datetime.fromtimestamp(timestamp).astimezone()
+    midnight = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow = midnight + timedelta(days=1)
+    next_day = tomorrow + timedelta(days=1)
+    start_limit, stop_limit = timestamp - 3600, None
+    if mode == "now":
+        start_limit, stop_limit = timestamp, timestamp
+    elif mode == "tonight":
+        start_limit = max(timestamp, int(midnight.replace(hour=18).timestamp()))
+        stop_limit = int(tomorrow.timestamp())
+    elif mode == "tomorrow":
+        start_limit, stop_limit = int(tomorrow.timestamp()), int(next_day.timestamp())
+    needle = search[:100].strip().casefold()
+    result = []
+    for entry in entries:
+        start, stop = int(entry.get("start") or 0), int(entry.get("stop") or 0)
+        if mode == "now":
+            in_range = start <= timestamp < stop
+        else:
+            in_range = stop >= start_limit and (stop_limit is None or start < stop_limit)
+        haystack = " ".join(str(entry.get(key, "")) for key in
+                            ("title", "subtitle", "summary", "description", "channel_name")).casefold()
+        if in_range and (not channel or str(entry.get("channel_uuid", "")) == channel) and \
+                (not needle or needle in haystack):
+            result.append(dict(entry))
+    return sorted(result, key=lambda item: (int(item.get("start") or 0), str(item.get("channel_name", ""))))
 
 
 def recording_rule_node(body: dict[str, Any], kind: str, profile_ids: set[str],
@@ -1044,12 +1083,18 @@ class Handler(SimpleHTTPRequestHandler):
                 self._json({"entries": sorted(entries, key=channel_sort)})
             elif path == "/api/epg":
                 search = query.get("q", [""])[0][:100]
+                mode = query.get("mode", ["all"])[0]
+                channel = query.get("channel", [""])[0]
                 with CACHE.lock:
                     entries = list(CACHE.epg)
-                needle = search.casefold()
-                entries = [e for e in entries if (e.get("stop") or 0) >= now() - 3600 and
-                           (not needle or needle in " ".join(str(e.get(k, "")) for k in ("title", "channel_name", "summary")).casefold())]
-                self._json({"entries": sorted(entries, key=lambda e: e.get("start") or 0)[:500]})
+                    channels = [{"uuid": str(item.get("uuid", "")), "name": str(item.get("name", "")),
+                                 "number": str(item.get("number", ""))}
+                                for item in CACHE.channels if item.get("enabled", 1)]
+                if channel and channel not in {item["uuid"] for item in channels}:
+                    raise ValueError("节目单频道筛选无效")
+                entries = filter_epg_entries(entries, mode, search, channel)
+                self._json({"entries": entries[:1000], "total": len(entries), "channels": channels,
+                            "serverTime": now(), "mode": mode})
             elif path == "/api/dvr/options":
                 search = query.get("q", [""])[0][:100].casefold()
                 channel = query.get("channel", [""])[0]
