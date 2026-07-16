@@ -522,15 +522,16 @@ def safe_recording_entry(entry: dict[str, Any]) -> dict[str, Any]:
 
 
 def safe_autorec_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    allowed = ("uuid", "enabled", "title", "channel", "tag", "start", "start_window", "weekdays",
-               "comment", "owner", "creator", "maxcount", "maxsched", "minduration", "maxduration")
+    allowed = ("uuid", "enabled", "name", "title", "fulltext", "channel", "config_name", "tag",
+               "start", "start_window", "weekdays", "comment", "owner", "creator", "maxcount",
+               "maxsched", "minduration", "maxduration")
     return {key: redact_sensitive(entry.get(key), key, hide_frequency=False)
             for key in allowed if key in entry}
 
 
 def safe_timerec_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    allowed = ("uuid", "enabled", "name", "title", "channel", "start", "stop", "weekdays",
-               "comment", "owner", "creator")
+    allowed = ("uuid", "enabled", "name", "title", "channel", "config_name", "start", "stop",
+               "weekdays", "comment", "owner", "creator")
     return {key: redact_sensitive(entry.get(key), key, hide_frequency=False)
             for key in allowed if key in entry}
 
@@ -593,6 +594,40 @@ def recording_attention_entries(entries: list[dict[str, Any]]) -> list[dict[str,
 
 def valid_uuid(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-fA-F]{32}", value))
+
+
+def recording_rule_node(body: dict[str, Any], kind: str, profile_ids: set[str],
+                        channel_ids: set[str]) -> dict[str, Any]:
+    """Validate the editable rule fields and return an idnode/save whitelist."""
+    if kind not in ("autorec", "timerec"):
+        raise ValueError("录像规则类型无效")
+    uuid = str(body.get("uuid", ""))
+    name, title = str(body.get("name", "")).strip(), str(body.get("title", "")).strip()
+    channel, config_uuid = str(body.get("channel", "")), str(body.get("configUuid", ""))
+    enabled = body.get("enabled")
+    if not valid_uuid(uuid) or not name or len(name) > 80 or len(title) > 120 or \
+            not isinstance(enabled, bool) or config_uuid not in profile_ids:
+        raise ValueError("录像规则内容无效")
+    if channel and (not valid_uuid(channel) or channel not in channel_ids):
+        raise ValueError("频道不存在")
+    if kind == "autorec":
+        if not title:
+            raise ValueError("自动录像必须填写节目标题表达式")
+        return {"uuid": uuid, "enabled": enabled, "name": name, "title": title,
+                "fulltext": bool(body.get("fulltext")), "channel": channel,
+                "config_name": config_uuid}
+    start, stop = str(body.get("start", "")), str(body.get("stop", ""))
+    raw_weekdays = body.get("weekdays", [])
+    if not isinstance(raw_weekdays, list):
+        raise ValueError("星期参数无效")
+    weekdays = sorted({int(day) for day in raw_weekdays if str(day).isdigit()})
+    if not valid_uuid(channel) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start) or \
+            not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", stop) or not weekdays or \
+            any(day not in range(1, 8) for day in weekdays):
+        raise ValueError("手动定时录像内容无效")
+    return {"uuid": uuid, "enabled": enabled, "name": name, "title": title or name,
+            "channel": channel, "config_name": config_uuid, "start": start, "stop": stop,
+            "weekdays": weekdays}
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -866,6 +901,25 @@ class Handler(SimpleHTTPRequestHandler):
                                         {"conf": json.dumps(conf, ensure_ascii=False), "config_uuid": config_uuid}, method="POST")
                 COLLECTOR.trigger()
                 self._json({"ok": True, "uuid": result.get("uuid", "")})
+            elif path == "/api/dvr/rule/update":
+                body, client = self._body(), COLLECTOR.client()
+                kind, uuid = str(body.get("kind", "")), str(body.get("uuid", ""))
+                sources = {"autorec": "dvr/autorec/grid", "timerec": "dvr/timerec/grid"}
+                if kind not in sources or not valid_uuid(uuid):
+                    raise ValueError("录像规则类型或 UUID 无效")
+                rules = client.request(sources[kind], {"limit": 10000}).get("entries", [])
+                if not any(str(item.get("uuid", "")) == uuid for item in rules):
+                    raise ValueError("录像规则不存在或状态已经改变")
+                profiles = client.request("dvr/config/grid", {"limit": 100}).get("entries", [])
+                profile_ids = {str(item.get("uuid", "")) for item in profiles if valid_uuid(str(item.get("uuid", "")))}
+                with CACHE.lock:
+                    channel_ids = {str(item.get("uuid", "")) for item in CACHE.channels}
+                node = recording_rule_node(body, kind, profile_ids, channel_ids)
+                client.request("idnode/save", {
+                    "node": json.dumps(node, ensure_ascii=False, separators=(",", ":"))
+                }, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True, "uuid": uuid})
             elif path == "/api/dvr/action":
                 body, client = self._body(), COLLECTOR.client()
                 action, uuid = str(body.get("action", "")), str(body.get("uuid", ""))
@@ -1035,7 +1089,8 @@ class Handler(SimpleHTTPRequestHandler):
                     with CACHE.lock:
                         channel_names = {str(item.get("uuid", "")): str(item.get("name", "")) for item in CACHE.channels}
                     for item in safe_entries:
-                        item["channel"] = channel_names.get(str(item.get("channel", "")), item.get("channel", ""))
+                        item["channel_uuid"] = str(item.get("channel", ""))
+                        item["channel"] = channel_names.get(item["channel_uuid"], item.get("channel", ""))
                 sort_dvr_entries(safe_entries, section)
                 self._json({"section": section, "entries": safe_entries, "total": len(safe_entries)})
             elif path == "/api/history":
