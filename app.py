@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""TVH 管理台：一个无运行时第三方依赖的 Tvheadend 监控面板。"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import logging
+import mimetypes
+import os
+import signal
+import secrets
+import socket
+import sqlite3
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from http import HTTPStatus
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+APP_VERSION = "1.0.0"
+LOG = logging.getLogger("tvh-insight")
+DATA_DIR = Path(os.getenv("TVHMON_DATA_DIR", "./data")).resolve()
+DB_PATH = DATA_DIR / "tvh-insight.db"
+STATIC_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "static"
+POLL_SECONDS = max(5, int(os.getenv("TVHMON_POLL_SECONDS", "10")))
+FULL_SYNC_SECONDS = max(60, int(os.getenv("TVHMON_FULL_SYNC_SECONDS", "300")))
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS viewing_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, subscription_key TEXT NOT NULL,
+  username TEXT NOT NULL, channel_name TEXT NOT NULL, client_ip TEXT NOT NULL DEFAULT '', client TEXT,
+  started_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,
+  ended_at INTEGER, duration_seconds INTEGER NOT NULL DEFAULT 0,
+  active INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_viewing_active ON viewing_sessions(active, subscription_key);
+CREATE INDEX IF NOT EXISTS idx_viewing_started ON viewing_sessions(started_at DESC);
+"""
+
+OBSOLETE_TABLES = ("channels", "epg_events", "input_samples", "current_inputs", "resource_snapshots", "sync_runs")
+
+
+def now() -> int:
+    return int(time.time())
+
+
+def scalar(value: Any, default: Any = "") -> Any:
+    """Tvheadend occasionally returns localized values as small dictionaries."""
+    if value is None:
+        return default
+    if isinstance(value, dict):
+        return next(iter(value.values()), default)
+    return value
+
+
+def redact_sensitive(value: Any, key: str = "", hide_frequency: bool = True) -> Any:
+    """Remove stream addresses and tuning frequencies before data reaches the cache."""
+    sensitive_keys = {"url", "iptv_url", "playlist_url", "src", "frequency", "freq", "frequency_min", "frequency_max"}
+    if key.lower() in sensitive_keys and (hide_frequency or key.lower() not in {"frequency", "freq", "frequency_min", "frequency_max"}):
+        return "[已隐藏]"
+    if isinstance(value, dict):
+        return {k: redact_sensitive(v, k, hide_frequency) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_sensitive(v, key, hide_frequency) for v in value]
+    if isinstance(value, str):
+        lowered = value.lower()
+        if any(scheme in lowered for scheme in ("http://", "https://", "udp://", "rtsp://", "rtmp://", "srt://")):
+            return "[流地址已隐藏]"
+        if hide_frequency and any(unit in lowered for unit in ("mhz", "khz", " ghz", " hz")):
+            return "[频率已隐藏]"
+    return value
+
+
+class Store:
+    def __init__(self, path: Path):
+        self.path = path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self.connect() as db:
+            db.executescript(SCHEMA)
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(viewing_sessions)")}
+            if "client_ip" not in columns:
+                db.execute("ALTER TABLE viewing_sessions ADD COLUMN client_ip TEXT NOT NULL DEFAULT ''")
+            # Versions before 0.2 cached display data in SQLite. Remove those
+            # tables during migration so the new data-minimisation promise also
+            # applies to existing installations.
+            for table in OBSOLETE_TABLES:
+                db.execute(f"DROP TABLE IF EXISTS {table}")
+            for row in db.execute("SELECT id,subscription_key FROM viewing_sessions").fetchall():
+                if "://" in row["subscription_key"]:
+                    opaque = hashlib.sha256(row["subscription_key"].encode()).hexdigest()
+                    db.execute("UPDATE viewing_sessions SET subscription_key=? WHERE id=?", (opaque, row["id"]))
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    @contextmanager
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        try:
+            yield db
+            db.commit()
+        finally:
+            db.close()
+
+    def setting(self, key: str, default: str = "") -> str:
+        with self.connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            return row[0] if row else default
+
+    def settings(self) -> dict[str, str]:
+        with self.connect() as db:
+            return {r["key"]: r["value"] for r in db.execute("SELECT key,value FROM settings")}
+
+    def save_settings(self, values: dict[str, str]) -> None:
+        ts = now()
+        with self.connect() as db:
+            db.executemany(
+                "INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                [(k, v, ts) for k, v in values.items()],
+            )
+
+class MemoryCache:
+    """Ephemeral Tvheadend state. Nothing in this object is written to disk."""
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.channels: list[dict[str, Any]] = []
+        self.epg: list[dict[str, Any]] = []
+        self.inputs: list[dict[str, Any]] = []
+        self.resources: dict[str, dict[str, Any]] = {}
+        self.last_sync: dict[str, Any] | None = None
+
+    def sync_result(self, ok: bool, message: str = "") -> None:
+        with self.lock:
+            self.last_sync = {"ok": int(ok), "message": message[:1000], "created_at": now()}
+
+
+CACHE = MemoryCache()
+
+
+def safe_connection(entry: dict[str, Any], timestamp: int | None = None) -> dict[str, Any] | None:
+    """Return only the client-facing connection fields needed by management UI."""
+    timestamp = timestamp if timestamp is not None else now()
+    try:
+        connection_id = int(entry.get("id"))
+    except (TypeError, ValueError):
+        return None
+    peer = str(entry.get("peer") or "").removeprefix("::ffff:")
+    try:
+        peer = str(ipaddress.ip_address(peer))
+    except ValueError:
+        peer = "未知地址"
+    try:
+        started = int(entry.get("started") or timestamp)
+    except (TypeError, ValueError):
+        started = timestamp
+    if started > timestamp or started < timestamp - 365 * 86400:
+        started = timestamp
+    return {"id": connection_id, "peer": peer, "peer_port": max(0, int(entry.get("peer_port") or 0)),
+            "started": started, "streaming": bool(entry.get("streaming")),
+            "type": str(redact_sensitive(entry.get("type") or "未知协议"))[:40],
+            "user": str(redact_sensitive(entry.get("user") or "匿名"))[:120]}
+
+
+class TvhClient:
+    def __init__(self, url: str, username: str, password: str, timeout: int = 12):
+        self.url = url.rstrip("/")
+        self.timeout = timeout
+        self.basic_authorization = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        manager = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        manager.add_password(None, self.url, username, password)
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPDigestAuthHandler(manager),
+            urllib.request.HTTPBasicAuthHandler(manager),
+        )
+
+    def request(self, endpoint: str, params: dict[str, Any] | None = None, method: str = "GET") -> dict[str, Any]:
+        method = method.upper()
+        if method not in ("GET", "POST"):
+            raise ValueError("Tvheadend API 只允许 GET 或 POST")
+        encoded = urllib.parse.urlencode(params or {})
+        target = f"{self.url}/api/{endpoint}" + (f"?{encoded}" if encoded and method == "GET" else "")
+        # Some TVH "plain" configurations return 403 without sending an HTTP
+        # authentication challenge. Preemptive Basic is needed for those builds;
+        # the opener still handles a Digest challenge when the server sends one.
+        headers = {"Accept": "application/json", "User-Agent": f"TVH-Insight/{APP_VERSION}",
+                   "Authorization": self.basic_authorization}
+        data = encoded.encode() if method == "POST" else None
+        if data is not None:
+            headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+        req = urllib.request.Request(target, data=data, headers=headers, method=method)
+        try:
+            with self.opener.open(req, timeout=self.timeout) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise RuntimeError("认证失败或该用户没有管理员/API 权限") from exc
+            raise RuntimeError(f"TvHeadend 返回 HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"无法连接 TvHeadend：{getattr(exc, 'reason', exc)}") from exc
+
+    def fetch_image(self, source: str) -> tuple[bytes, str]:
+        target = urllib.parse.urljoin(self.url + "/", source.lstrip("/"))
+        parsed = urllib.parse.urlsplit(target)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("频道图标地址只允许 HTTP 或 HTTPS")
+        if parsed.username or parsed.password:
+            raise ValueError("频道图标地址不能包含账号密码")
+        try:
+            hostname = parsed.hostname.encode("idna").decode("ascii")
+            port = parsed.port
+        except (UnicodeError, ValueError) as exc:
+            raise ValueError("频道图标地址格式无效") from exc
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        netloc = hostname + (f":{port}" if port is not None else "")
+        # HTTP request lines are ASCII. Keep URL separators and existing percent
+        # escapes intact while encoding Unicode filenames and query values.
+        target = urllib.parse.urlunsplit((
+            parsed.scheme, netloc,
+            urllib.parse.quote(parsed.path or "/", safe="/%:@!$&'()*+,;=-._~"),
+            urllib.parse.quote(parsed.query, safe="=&;%:+,/?@!$'()*-._~"),
+            "",
+        ))
+        headers = {"User-Agent": f"TVH-Insight/{APP_VERSION}"}
+        # External channel logos are allowed, but TVH credentials must only ever
+        # be sent back to the configured Tvheadend origin.
+        base_origin = urllib.parse.urlsplit(self.url)
+        image_origin = urllib.parse.urlsplit(target)
+        if (base_origin.scheme, base_origin.netloc) == (image_origin.scheme, image_origin.netloc):
+            headers["Authorization"] = self.basic_authorization
+        req = urllib.request.Request(target, headers=headers)
+        with self.opener.open(req, timeout=self.timeout) as response:
+            return response.read(4 * 1024 * 1024), response.headers.get_content_type()
+
+
+class Collector:
+    def __init__(self, store: Store):
+        self.store = store
+        self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.last_full = 0
+        self.running_lock = threading.Lock()
+
+    def client(self) -> TvhClient:
+        cfg = self.store.settings()
+        if not cfg.get("tvh_url"):
+            raise RuntimeError("尚未配置 TvHeadend")
+        password = os.getenv("TVHMON_TVH_PASSWORD", cfg.get("tvh_password", ""))
+        return TvhClient(cfg["tvh_url"], cfg.get("tvh_username", ""), password)
+
+    def start(self) -> None:
+        if not self.thread:
+            self.thread = threading.Thread(target=self._loop, name="collector", daemon=True)
+            self.thread.start()
+
+    def trigger(self) -> None:
+        self.last_full = 0
+        self.wake_event.set()
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            if self.store.setting("tvh_url"):
+                self.collect_once(force_full=(now() - self.last_full >= FULL_SYNC_SECONDS))
+            self.wake_event.wait(self.poll_seconds())
+            self.wake_event.clear()
+
+    def poll_seconds(self) -> int:
+        try:
+            value = int(self.store.setting("poll_seconds", str(POLL_SECONDS)))
+        except ValueError:
+            value = POLL_SECONDS
+        return value if value in (10, 20, 30, 60) else POLL_SECONDS
+
+    def collect_once(self, force_full: bool = False) -> None:
+        if not self.running_lock.acquire(blocking=False):
+            return
+        try:
+            client = self.client()
+            self._collect_live(client)
+            if force_full:
+                self._collect_catalog(client)
+                self.last_full = now()
+            CACHE.sync_result(True)
+        except Exception as exc:  # the collector must remain alive after a transient TVH error
+            LOG.warning("collection failed: %s", exc)
+            CACHE.sync_result(False, str(exc))
+        finally:
+            self.running_lock.release()
+
+    def _collect_catalog(self, client: TvhClient) -> None:
+        channels = client.request("channel/grid", {"limit": 10000, "all": 1}).get("entries", [])
+        events = client.request("epg/events/grid", {"limit": 10000}).get("entries", [])
+        ts = now()
+        safe_channels = []
+        for c in channels:
+            safe_channels.append({
+                "uuid": str(c.get("uuid") or c.get("key") or c.get("id") or c.get("name")),
+                "number": str(c.get("number", "")), "name": str(scalar(c.get("name"), "未命名频道")),
+                "icon": c.get("icon_public_url") or c.get("icon"), "enabled": int(c.get("enabled", True)),
+                "updated_at": ts,
+            })
+        safe_events = []
+        for e in events:
+            genre = e.get("genre") or e.get("contentType") or ""
+            safe_events.append({
+                "event_id": str(e.get("eventId") or e.get("id") or f"{e.get('channelUuid')}:{e.get('start')}"),
+                "channel_uuid": e.get("channelUuid"), "channel_name": scalar(e.get("channelName")),
+                "title": scalar(e.get("title"), "无标题"), "subtitle": scalar(e.get("subtitle")),
+                "summary": scalar(e.get("summary") or e.get("description")), "start": e.get("start"),
+                "stop": e.get("stop"), "genre": genre, "updated_at": ts,
+            })
+        with CACHE.lock:
+            CACHE.channels = safe_channels
+            CACHE.epg = [redact_sensitive(e) for e in safe_events if not e.get("stop") or e["stop"] >= ts - 86400]
+        # Optional endpoints differ between TVH releases. A failure in one module
+        # is stored for the UI, but must not hide data from all other modules.
+        optional = {
+            "recordings": ("dvr/entry/grid", {"limit": 10000}),
+            "server_info": ("serverinfo", {}),
+        }
+        for resource, (endpoint, params) in optional.items():
+            try:
+                payload = client.request(endpoint, params)
+                entries = payload.get("entries", payload.get("nodes", payload))
+                if isinstance(entries, dict):
+                    entries = [entries]
+                safe_entries = redact_sensitive(entries if isinstance(entries, list) else [])
+                self._save_resource(resource, safe_entries, payload.get("totalCount"), "")
+            except Exception as exc:
+                self._save_resource(resource, [], None, str(exc))
+
+    def _save_resource(self, resource: str, entries: list[Any], total: Any, error: str) -> None:
+        with CACHE.lock:
+            CACHE.resources[resource] = {"entries": entries, "totalCount": total if total is not None else len(entries),
+                                         "error": error[:1000], "updatedAt": now()}
+
+    @staticmethod
+    def _input_kind(name: str, stream: str) -> str:
+        text = f"{name} {stream}".lower()
+        if any(word in text for word in ("iptv", "http://", "https://", "udp://", "rtsp://")):
+            return "IPTV"
+        if any(word in text for word in ("dvb", "atsc", "isdb", "tuner", "frontend")):
+            return "调谐器"
+        return "其他"
+
+    def _collect_live(self, client: TvhClient) -> None:
+        ts = now()
+        subscriptions = client.request("status/subscriptions").get("entries", [])
+        inputs = client.request("status/inputs").get("entries", [])
+        try:
+            raw_connections = client.request("status/connections").get("entries", [])
+            connections = [safe for item in raw_connections if (safe := safe_connection(item, ts)) is not None]
+            self._save_resource("connections", connections, len(connections), "")
+        except Exception as exc:
+            self._save_resource("connections", [], None, str(exc))
+        safe_inputs = []
+        for item in inputs:
+            # Frequency shown by status/inputs is live tuner state, not persisted
+            # mux configuration. It is safe to display; stream URLs remain hidden.
+            name = str(redact_sensitive(item.get("input", "未知输入"), hide_frequency=False))
+            stream = str(redact_sensitive(item.get("stream", ""), hide_frequency=False))
+            safe_inputs.append({
+                "input_uuid": str(item.get("uuid") or item.get("input") or item.get("id")),
+                "input_name": name, "stream_name": stream, "kind": self._input_kind(name, stream),
+                "signal": item.get("signal"), "signal_scale": item.get("signal_scale", 0),
+                "snr": item.get("snr"), "snr_scale": item.get("snr_scale", 0), "bps": item.get("bps", 0),
+                "subscribers": item.get("subs", 0),
+                "errors": sum(int(item.get(k, 0) or 0) for k in ("cc", "te", "unc", "ec_block")),
+                "sampled_at": ts,
+            })
+        with CACHE.lock:
+            CACHE.inputs = safe_inputs
+        with self.store.connect() as db:
+            seen: set[str] = set()
+            for sub in subscriptions:
+                username = str(redact_sensitive(sub.get("username") or sub.get("user") or sub.get("client") or "匿名"))
+                channel = str(redact_sensitive(sub.get("channel") or sub.get("channelName") or sub.get("title") or sub.get("service") or "未知频道"))
+                raw_ip = str(sub.get("hostname") or sub.get("peer") or "").removeprefix("::ffff:")
+                try:
+                    client_ip = str(ipaddress.ip_address(raw_ip))
+                except ValueError:
+                    client_ip = ""
+                client_name = re.sub(r"[\x00-\x1f\x7f]+", " ", str(redact_sensitive(sub.get("client") or sub.get("title") or "")))
+                client_name = " ".join(client_name.split())[:160]
+                public_id = sub.get("id") or sub.get("uuid")
+                key = str(public_id) if public_id is not None else hashlib.sha256(
+                    f"{username}\0{channel}\0{sub.get('start') or sub.get('started') or ''}".encode()).hexdigest()
+                seen.add(key)
+                row = db.execute("SELECT id,started_at FROM viewing_sessions WHERE active=1 AND subscription_key=?", (key,)).fetchone()
+                if row:
+                    db.execute("UPDATE viewing_sessions SET username=?,channel_name=?,last_seen_at=?,duration_seconds=?,client_ip=?,client=? WHERE id=?",
+                               (username, channel, ts, ts - row["started_at"], client_ip, client_name, row["id"]))
+                else:
+                    started = int(sub.get("start") or sub.get("started") or ts)
+                    if started > ts or started < ts - 30 * 86400:
+                        started = ts
+                    db.execute("INSERT INTO viewing_sessions(subscription_key,username,channel_name,client_ip,client,started_at,last_seen_at,duration_seconds,active) VALUES(?,?,?,?,?,?,?,?,1)",
+                               (key, username, channel, client_ip, client_name, started, ts, max(0, ts - started)))
+            active = db.execute("SELECT id,subscription_key,started_at FROM viewing_sessions WHERE active=1").fetchall()
+            for session in active:
+                if session["subscription_key"] not in seen:
+                    db.execute("UPDATE viewing_sessions SET active=0,ended_at=?,duration_seconds=? WHERE id=?",
+                               (ts, max(0, ts - session["started_at"]), session["id"]))
+
+STORE = Store(DB_PATH)
+COLLECTOR = Collector(STORE)
+
+
+def rows(db: sqlite3.Connection, query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    return [dict(row) for row in db.execute(query, params).fetchall()]
+
+
+class Handler(SimpleHTTPRequestHandler):
+    server_version = f"TVH-Insight/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        LOG.info("%s - %s", self.client_address[0], fmt % args)
+
+    def _json(self, data: Any, status: int = 200) -> None:
+        body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self) -> bool:
+        username = os.getenv("TVHMON_WEB_USERNAME", "")
+        password = os.getenv("TVHMON_WEB_PASSWORD", "")
+        if not username:
+            return True
+        expected = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        if secrets.compare_digest(self.headers.get("Authorization", ""), expected):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="TVH 管理台", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def _body(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 1024 * 1024:
+            raise ValueError("请求太大")
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def _error(self, exc: Exception, status: int = 400) -> None:
+        self._json({"ok": False, "error": str(exc)}, status)
+
+    def do_POST(self) -> None:
+        if not self._authorized():
+            return
+        path = urllib.parse.urlparse(self.path).path
+        try:
+            if path == "/api/setup":
+                body = self._body()
+                url = str(body.get("url", "")).strip().rstrip("/")
+                if not url.startswith(("http://", "https://")):
+                    raise ValueError("地址必须以 http:// 或 https:// 开头")
+                parsed_url = urllib.parse.urlsplit(url)
+                if not parsed_url.hostname or parsed_url.username or parsed_url.password:
+                    raise ValueError("地址里不要写账号密码，请使用下面单独的用户名和密码输入框")
+                username, password = str(body.get("username", "")), str(body.get("password", ""))
+                client = TvhClient(url, username, password)
+                client.request("channel/grid", {"limit": 1})
+                client.request("status/subscriptions")
+                STORE.save_settings({"tvh_url": url, "tvh_username": username, "tvh_password": password})
+                COLLECTOR.collect_once(force_full=True)
+                self._json({"ok": True})
+            elif path == "/api/sync":
+                if not STORE.setting("tvh_url"):
+                    raise ValueError("尚未配置 TvHeadend")
+                COLLECTOR.trigger()
+                self._json({"ok": True})
+            elif path == "/api/clients/disconnect":
+                raw_id, client = self._body().get("id"), COLLECTOR.client()
+                if isinstance(raw_id, bool) or not str(raw_id).isdigit() or int(raw_id) <= 0:
+                    raise ValueError("客户端连接 ID 无效")
+                connection_id = int(raw_id)
+                connections = client.request("status/connections").get("entries", [])
+                if not any(str(item.get("id", "")) == str(connection_id) for item in connections):
+                    raise ValueError("客户端连接不存在或已经断开")
+                client.request("connections/cancel", {"id": connection_id}, method="POST")
+                COLLECTOR.trigger()
+                self._json({"ok": True, "id": connection_id})
+            elif path.rstrip("/") == "/api/preferences":
+                interval = int(self._body().get("pollSeconds", 0))
+                if interval not in (10, 20, 30, 60):
+                    raise ValueError("采集间隔只能选择 10、20、30 或 60 秒")
+                STORE.save_settings({"poll_seconds": str(interval)})
+                COLLECTOR.wake_event.set()
+                self._json({"ok": True, "pollSeconds": interval})
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+        except Exception as exc:
+            self._error(exc)
+
+    def do_GET(self) -> None:
+        if not self._authorized():
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
+        try:
+            if path == "/api/bootstrap":
+                cfg = STORE.settings()
+                self._json({"configured": bool(cfg.get("tvh_url")), "url": cfg.get("tvh_url", ""),
+                            "username": cfg.get("tvh_username", ""), "pollSeconds": COLLECTOR.poll_seconds(),
+                            "version": APP_VERSION, "lastSync": CACHE.last_sync})
+            elif path == "/api/dashboard":
+                self._dashboard()
+            elif path == "/api/channels":
+                with CACHE.lock:
+                    entries = list(CACHE.channels)
+                def channel_sort(item: dict[str, Any]):
+                    try:
+                        number = float(item.get("number") or 10**12)
+                    except (TypeError, ValueError):
+                        number = 10**12
+                    return number, item.get("name", "")
+                self._json({"entries": sorted(entries, key=channel_sort)})
+            elif path == "/api/epg":
+                search = query.get("q", [""])[0][:100]
+                with CACHE.lock:
+                    entries = list(CACHE.epg)
+                needle = search.casefold()
+                entries = [e for e in entries if (e.get("stop") or 0) >= now() - 3600 and
+                           (not needle or needle in " ".join(str(e.get(k, "")) for k in ("title", "channel_name", "summary")).casefold())]
+                self._json({"entries": sorted(entries, key=lambda e: e.get("start") or 0)[:500]})
+            elif path == "/api/history":
+                with STORE.connect() as db:
+                    self._json({
+                        "entries": rows(db, "SELECT * FROM viewing_sessions ORDER BY active DESC,started_at DESC LIMIT 1000"),
+                        "summary": rows(db, "SELECT username,channel_name,COUNT(*) session_count,SUM(duration_seconds) total_seconds "
+                                            "FROM viewing_sessions GROUP BY username,channel_name ORDER BY total_seconds DESC"),
+                    })
+            elif path == "/api/status":
+                with CACHE.lock:
+                    inputs = sorted(list(CACHE.inputs), key=lambda x: (-int(x.get("subscribers") or 0), x.get("input_name", "")))
+                    last = dict(CACHE.last_sync) if CACHE.last_sync else None
+                self._json({"inputs": inputs, "syncRuns": [last] if last else []})
+            elif path == "/api/clients":
+                with CACHE.lock:
+                    resource = dict(CACHE.resources.get("connections", {"entries": [], "error": "尚未取得连接信息"}))
+                self._json(resource)
+            elif path == "/api/resources":
+                with CACHE.lock:
+                    result = json.loads(json.dumps(CACHE.resources, ensure_ascii=False))
+                self._json({"resources": result})
+            elif path.startswith("/api/channels/") and path.endswith("/icon"):
+                self._channel_icon(path.split("/")[3])
+            elif path.startswith("/api/"):
+                self.send_error(HTTPStatus.NOT_FOUND)
+            else:
+                self._static(path)
+        except Exception as exc:
+            LOG.exception("request failed")
+            self._error(exc, 500)
+
+    def _dashboard(self) -> None:
+        ts = now()
+        with CACHE.lock:
+            current_epg = [dict(e) for e in CACHE.epg if (e.get("start") or 0) <= ts < (e.get("stop") or 0)]
+            inputs = sorted([dict(i) for i in CACHE.inputs], key=lambda x: (-int(x.get("subscribers") or 0), x.get("input_name", "")))
+            channel_count = sum(int(c.get("enabled", 1)) for c in CACHE.channels)
+            last = dict(CACHE.last_sync) if CACHE.last_sync else None
+        with STORE.connect() as db:
+            live = rows(db, "SELECT * FROM viewing_sessions WHERE active=1 ORDER BY started_at")
+            stats = dict(db.execute(
+                "SELECT (SELECT COUNT(*) FROM viewing_sessions WHERE active=1) viewers,"
+                "(SELECT COALESCE(SUM(duration_seconds),0) FROM viewing_sessions WHERE started_at>=?) watch_seconds", (ts - 86400,)).fetchone())
+        stats["channels"] = channel_count
+        stats["active_inputs"] = sum(1 for item in inputs if int(item.get("subscribers") or 0) > 0)
+        self._json({"stats": stats, "live": live, "currentEpg": current_epg, "inputs": inputs,
+                    "lastSync": last, "serverTime": ts})
+
+    def _channel_icon(self, uuid: str) -> None:
+        wanted = urllib.parse.unquote(uuid)
+        with CACHE.lock:
+            icon = next((c.get("icon") for c in CACHE.channels if c.get("uuid") == wanted), None)
+        if not icon:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        try:
+            data, content_type = COLLECTOR.client().fetch_image(icon)
+        except (urllib.error.URLError, TimeoutError, UnicodeError, ValueError) as exc:
+            LOG.warning("channel icon unavailable for %s: %s", wanted, exc)
+            self.send_error(HTTPStatus.BAD_GATEWAY, "频道图标暂时不可用")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class IPv6ThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        if self.server_address[0] == "::":
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+def create_http_server(host: str, port: int, handler: type[SimpleHTTPRequestHandler]) -> ThreadingHTTPServer:
+    server_type = IPv6ThreadingHTTPServer if ":" in host else ThreadingHTTPServer
+    return server_type((host, port), handler)
+
+
+def display_endpoint(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+    def _static(self, path: str) -> None:
+        relative = "index.html" if path in ("", "/") else path.lstrip("/")
+        candidate = (STATIC_DIR / relative).resolve()
+        if STATIC_DIR.resolve() not in candidate.parents and candidate != STATIC_DIR.resolve():
+            self.send_error(HTTPStatus.FORBIDDEN)
+            return
+        if not candidate.is_file():
+            candidate = STATIC_DIR / "index.html"
+        data = candidate.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", mimetypes.guess_type(candidate.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="TvHeadend monitoring dashboard")
+    parser.add_argument("--host", default=os.getenv("TVHMON_HOST", "0.0.0.0"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("TVHMON_PORT", "8088")))
+    parser.add_argument("--version", action="version", version=APP_VERSION)
+    args = parser.parse_args()
+    logging.basicConfig(level=os.getenv("TVHMON_LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
+    COLLECTOR.start()
+    server = create_http_server(args.host, args.port, Handler)
+    signal.signal(signal.SIGTERM, lambda *_: server.shutdown())
+    LOG.info("TVH 管理台 %s listening on http://%s", APP_VERSION, display_endpoint(args.host, args.port))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        COLLECTOR.stop_event.set()
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
