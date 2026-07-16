@@ -122,6 +122,7 @@
         <div class="record-dialog-pane">
           <label class="md-field"><input id="ruleName" placeholder=" " required><span>规则名称</span></label>
           <label class="md-field"><input id="ruleTitle" placeholder=" "><span id="ruleTitleLabel">节目标题表达式</span></label>
+          <label class="switch-row" id="ruleEnabledRow"><span><strong>启用规则</strong><small>关闭后保留规则，但不再建立录像任务</small></span><input id="ruleEnabled" type="checkbox" checked><i></i></label>
           <div id="ruleTimes" class="rule-times hidden"><label class="md-field"><input id="ruleStart" placeholder=" " value="20:00"><span>开始时间 HH:MM</span></label><label class="md-field"><input id="ruleStop" placeholder=" " value="21:00"><span>结束时间 HH:MM</span></label></div>
           <label class="switch-row" id="ruleFulltextRow"><span><strong>搜索完整节目资料</strong><small>同时匹配副标题、摘要和描述</small></span><input id="ruleFulltext" type="checkbox"><i></i></label>
           <div id="ruleWeekdays" class="weekday-choices hidden"></div>

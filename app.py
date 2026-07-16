@@ -860,7 +860,9 @@ class Handler(SimpleHTTPRequestHandler):
                 body, client = self._body(), COLLECTOR.client()
                 title, name = str(body.get("title", "")).strip(), str(body.get("name", "")).strip()
                 channel, config_uuid = str(body.get("channel", "")), str(body.get("configUuid", ""))
-                if not title or len(title) > 120 or (channel and not valid_uuid(channel)) or not valid_uuid(config_uuid):
+                enabled = body.get("enabled", True)
+                if (not title or len(title) > 120 or (channel and not valid_uuid(channel))
+                        or not valid_uuid(config_uuid) or not isinstance(enabled, bool)):
                     raise ValueError("自动录像规则内容无效")
                 profiles = client.request("dvr/config/grid", {"limit": 100}).get("entries", [])
                 if config_uuid not in {str(item.get("uuid", "")) for item in profiles}:
@@ -869,7 +871,7 @@ class Handler(SimpleHTTPRequestHandler):
                     channel_ids = {str(item.get("uuid", "")) for item in CACHE.channels}
                 if channel and channel not in channel_ids:
                     raise ValueError("频道不存在")
-                conf = {"enabled": True, "name": name[:80], "title": title,
+                conf = {"enabled": enabled, "name": name[:80], "title": title,
                         "fulltext": bool(body.get("fulltext")), "channel": channel,
                         "config_name": config_uuid, "comment": "由 TVH 管理台创建"}
                 result = client.request("dvr/autorec/create",
@@ -881,11 +883,12 @@ class Handler(SimpleHTTPRequestHandler):
                 name, title = str(body.get("name", "")).strip(), str(body.get("title", "")).strip()
                 channel, config_uuid = str(body.get("channel", "")), str(body.get("configUuid", ""))
                 start, stop = str(body.get("start", "")), str(body.get("stop", ""))
+                enabled = body.get("enabled", True)
                 weekdays = sorted({int(day) for day in body.get("weekdays", []) if str(day).isdigit()})
                 if (not name or len(name) > 80 or len(title) > 120 or not valid_uuid(channel)
                         or not valid_uuid(config_uuid) or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", start)
                         or not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", stop) or not weekdays
-                        or any(day not in range(1, 8) for day in weekdays)):
+                        or any(day not in range(1, 8) for day in weekdays) or not isinstance(enabled, bool)):
                     raise ValueError("手动定时录像内容无效")
                 profiles = client.request("dvr/config/grid", {"limit": 100}).get("entries", [])
                 if config_uuid not in {str(item.get("uuid", "")) for item in profiles}:
@@ -894,7 +897,7 @@ class Handler(SimpleHTTPRequestHandler):
                     channel_ids = {str(item.get("uuid", "")) for item in CACHE.channels}
                 if channel not in channel_ids:
                     raise ValueError("频道不存在")
-                conf = {"enabled": True, "name": name, "title": title or name, "channel": channel,
+                conf = {"enabled": enabled, "name": name, "title": title or name, "channel": channel,
                         "start": start, "stop": stop, "weekdays": weekdays, "config_name": config_uuid,
                         "comment": "由 TVH 管理台创建"}
                 result = client.request("dvr/timerec/create",
