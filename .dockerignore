@@ -1,7 +1,15 @@
 .git
+.github
 data
 dist
 build
+release
 .build-venv
 __pycache__
 *.pyc
+tests
+scripts
+requirements-build.txt
+tvheadend-manager.spec
+docker-compose.yml
+README.md

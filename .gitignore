@@ -1,6 +1,7 @@
 data/
 dist/
 build/
+release/
 .build-venv/
 __pycache__/
 *.pyc
@@ -26,6 +27,8 @@ credentials*.json
 
 # Local editor, operating-system and log files.
 .DS_Store
+*.swp
+*.swo
 .idea/
 .vscode/
 *.log
