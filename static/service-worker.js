@@ -1,8 +1,8 @@
-const SHELL_CACHE = "tvheadend-manager-shell-v1.2.1";
+const SHELL_CACHE = "tvheadend-manager-shell-v1.2.2";
 const SHELL_ASSETS = [
   "/",
-  "/app.css?v=1.2.1.0",
-  "/app.js?v=1.2.1.0",
+  "/app.css?v=1.2.2.0",
+  "/app.js?v=1.2.2.0",
   "/favicon.svg",
   "/manifest.webmanifest",
   "/apple-touch-icon.png",
