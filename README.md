@@ -9,7 +9,9 @@ TvHeadend Manager 是一个适合电脑、平板和手机使用的中文 Tvheade
 需要先安装 Docker 和 Compose 插件。在项目目录运行：
 
 ```bash
-docker compose up -d --build
+mkdir -p data
+docker compose pull
+docker compose up -d
 ```
 
 然后打开：
@@ -24,15 +26,47 @@ http://服务器地址:8088
 docker compose logs -f tvheadend-manager
 ```
 
-更新代码后重新构建：
+更新镜像：
 
 ```bash
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 ```
 
-数据库保存在 `tvh-data` 数据卷中，重新构建容器不会删除已有设置和观看记录。
+数据库保存在项目目录的 `./data` 中，更新或重建容器不会删除已有设置和观看记录。迁移时停止容器并复制整个 `data` 目录即可。
 
-## Debian 直接运行
+Compose 默认以宿主机的 `1000:1000` 用户运行。当前账号不是这个 UID/GID 时，使用下面的方式启动或更新：
+
+```bash
+PUID=$(id -u) PGID=$(id -g) docker compose up -d
+```
+
+默认使用 `ghcr.io/hiper25/tvheadend-client-web:latest`，同时提供 `amd64` 和 `arm64` 镜像。也可以通过 `TVHMON_IMAGE` 换成指定版本，例如：
+
+```bash
+TVHMON_IMAGE=ghcr.io/hiper25/tvheadend-client-web:1.2.2 docker compose up -d
+```
+
+GitHub 第一次产出镜像后，仓库所有者需要在对应 Package 的设置中把可见性改为 Public。公开前只有登录过 GHCR 的设备可以拉取镜像。
+
+## Debian 单文件安装
+
+打开项目的 GitHub Releases，下载同一版本的 `tvheadend-manager-版本-debian12-amd64` 和 `.sha256` 文件。校验并赋予执行权限：
+
+```bash
+sha256sum -c tvheadend-manager-*-debian12-amd64.sha256
+chmod +x tvheadend-manager-*-debian12-amd64
+```
+
+运行程序：
+
+```bash
+TVHMON_DATA_DIR=./data ./tvheadend-manager-*-debian12-amd64 --host 0.0.0.0 --port 8088
+```
+
+单文件程序在 Debian 12 环境构建，适用于 `amd64` Debian 12/13。
+
+## Debian 使用 Python 运行
 
 Debian 12/13 安装 Python 3 后，在项目目录运行：
 
@@ -113,7 +147,7 @@ tv.example.com {
 | `TVHMON_REQUIRE_HTTPS` | 设为 `1` 时拒绝外部 HTTP |
 | `TVHMON_FORWARD_PORT` | Tvheadend 只读媒体转发端口，`0` 表示关闭 |
 
-## 构建 Debian 单文件程序
+## 本地构建 Debian 单文件程序
 
 构建机需要 Python、venv 和网络：
 

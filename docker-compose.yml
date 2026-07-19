@@ -1,0 +1,26 @@
+name: tvheadend-manager
+
+services:
+  tvheadend-manager:
+    image: ${TVHMON_IMAGE:-ghcr.io/hiper25/tvheadend-client-web:latest}
+    pull_policy: always
+    container_name: tvheadend-manager
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    ports:
+      - "${TVHMON_HTTP_PORT:-8088}:8088"
+      # 启用安全转发端口后，还要映射相同端口，例如：
+      # - "9991:9991"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      TVHMON_POLL_SECONDS: ${TVHMON_POLL_SECONDS:-10}
+      TVHMON_FULL_SYNC_SECONDS: ${TVHMON_FULL_SYNC_SECONDS:-300}
+      # 公网或不可信局域网部署时务必取消注释并修改：
+      # TVHMON_WEB_USERNAME: admin
+      # TVHMON_WEB_PASSWORD: change-me
+      # 也可用环境变量固定转发端口，0 表示关闭：
+      # TVHMON_FORWARD_PORT: 9991
