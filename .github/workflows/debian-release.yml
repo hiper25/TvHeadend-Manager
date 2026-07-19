@@ -1,0 +1,70 @@
+name: Debian single-file release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to build, for example v1.2.2
+        required: true
+        type: string
+
+concurrency:
+  group: debian-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  release:
+    if: startsWith(inputs.tag || github.ref_name, 'v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Build inside Debian 12
+        run: |
+          docker run --rm \
+            --env HOST_UID="$(id -u)" \
+            --env HOST_GID="$(id -g)" \
+            --volume "$GITHUB_WORKSPACE:/src" \
+            --workdir /src \
+            debian:12-slim \
+            sh -ec '
+              apt-get update
+              apt-get install -y --no-install-recommends python3 python3-venv ca-certificates binutils
+              ./scripts/build-binary.sh
+              chown -R "$HOST_UID:$HOST_GID" .build-venv build dist
+            '
+
+      - name: Verify and name release files
+        run: |
+          version="$(./dist/tvheadend-manager --version)"
+          expected="${RELEASE_TAG#v}"
+          test "$version" = "$expected"
+          mkdir -p release
+          install -m 0755 ./dist/tvheadend-manager "release/tvheadend-manager-${expected}-debian12-amd64"
+          cd release
+          sha256sum "tvheadend-manager-${expected}-debian12-amd64" > "tvheadend-manager-${expected}-debian12-amd64.sha256"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" release/* --clobber
+          else
+            gh release create "$RELEASE_TAG" release/* \
+              --verify-tag \
+              --generate-notes \
+              --title "TvHeadend Manager ${RELEASE_TAG#v}"
+          fi
