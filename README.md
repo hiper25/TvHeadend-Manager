@@ -66,6 +66,36 @@ TVHMON_DATA_DIR=./data ./tvheadend-manager-1.2.2-debian12-amd64 --host 0.0.0.0 -
 
 两个架构的单文件程序都在对应 CPU 的 Debian 12 环境原生构建，适用于 Debian 12/13。
 
+## Debian systemd 服务
+
+Release 同时提供 `tvheadend-manager.service` 和环境变量示例。先安装程序与 service：
+
+```bash
+sudo install -m 0755 tvheadend-manager-1.2.2-debian12-amd64 /usr/local/bin/tvheadend-manager
+sudo install -m 0644 tvheadend-manager.service /etc/systemd/system/tvheadend-manager.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now tvheadend-manager
+```
+
+ARM64 设备把第一条命令中的文件名换成 `tvheadend-manager-1.2.2-debian12-arm64`。服务默认监听 `0.0.0.0:8088`，数据库保存在 `/var/lib/tvheadend-manager`。
+
+需要修改端口或外网登录配置时，创建只允许 root 读取的环境变量文件：
+
+```bash
+sudo install -m 0600 tvheadend-manager.env.example /etc/tvheadend-manager.env
+sudoedit /etc/tvheadend-manager.env
+sudo systemctl restart tvheadend-manager
+```
+
+查看状态和日志：
+
+```bash
+systemctl status tvheadend-manager
+journalctl -u tvheadend-manager -f
+```
+
+更新版本时停止服务、替换 `/usr/local/bin/tvheadend-manager`，再重新启动。不要覆盖 `/var/lib/tvheadend-manager`。
+
 ## Debian 使用 Python 运行
 
 Debian 12/13 安装 Python 3 后，在项目目录运行：
